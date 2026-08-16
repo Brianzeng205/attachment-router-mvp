@@ -1,0 +1,2 @@
+"""Email attachment routing MVP."""
+

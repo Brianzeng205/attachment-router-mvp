@@ -1,0 +1,53 @@
+"""One polling cycle; schedule this command externally when ready."""
+import logging
+
+from .config import Settings
+from .claude_classifier import ClaudeDocumentClassifier
+from .gmail_client import GmailClient
+from .google_drive import GoogleDriveClient
+from .orchestrator import AttachmentProcessor, ProcessingSummary
+from .state import SqliteStateManager
+
+
+def build_state() -> SqliteStateManager:
+    return SqliteStateManager(Settings.from_env().state_db_path)
+
+
+def build_drive(settings: Settings | None = None) -> GoogleDriveClient:
+    """Create the real Drive adapter; email/classifier composition comes later."""
+    return GoogleDriveClient.from_settings(settings or Settings.from_env())
+
+
+def build_classifier(settings: Settings | None = None) -> ClaudeDocumentClassifier:
+    """Create the Claude adapter; email/classifier composition comes later."""
+    return ClaudeDocumentClassifier.from_settings(settings or Settings.from_env())
+
+
+def build_email(settings: Settings | None = None) -> GmailClient:
+    return GmailClient.from_settings(settings or Settings.from_env())
+
+
+def run_once(settings: Settings | None = None) -> ProcessingSummary:
+    settings = settings or Settings.from_env()
+    processor = AttachmentProcessor(
+        build_email(settings),
+        build_classifier(settings),
+        build_drive(settings),
+        SqliteStateManager(settings.state_db_path),
+        settings,
+    )
+    summary = processor.process_all()
+    logging.getLogger(__name__).info(
+        "Polling cycle complete uploaded=%s skipped=%s errors=%s",
+        summary.uploaded, summary.skipped, summary.errors,
+    )
+    return summary
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        run_once()
+    except Exception:
+        logging.getLogger(__name__).exception("Polling cycle failed")
+        raise SystemExit(1)
