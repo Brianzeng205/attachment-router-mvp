@@ -44,3 +44,17 @@ class KnowledgeTests(unittest.TestCase):
    def retrieve(self,q,limit): raise RuntimeError('fts unavailable')
   with self.assertRaises(RuntimeError): KnowledgeRetrievalService(self.r,Broken(),retriever_version='broken').retrieve(1,100,Analysis())
   self.assertEqual(self.r.connection.execute("SELECT status FROM knowledge_retrieval_runs ORDER BY id DESC").fetchone()[0],'failed')
+ def test_index_fingerprint_audit_and_failure_isolation(self):
+  file=self.k/'refund.txt'; body='Refund policy secret body'; file.write_text(body); self.s.ingest_all()
+  first=self.r.knowledge_index_fingerprint('v1'); self.s.ingest_all(); self.assertEqual(first,self.r.knowledge_index_fingerprint('v1'))
+  class Analysis: current_intent='refund'; latest_sender_request='refund'; unresolved_requests=(); order_numbers=()
+  class Counting:
+   def __init__(self, result): self.calls=0; self.result=result
+   def retrieve(self,q,limit): self.calls+=1; return self.result
+  match=SqliteKnowledgeRetriever(self.r).retrieve(KnowledgeQuery('refund'),limit=1)
+  retriever=Counting(match); service=KnowledgeRetrievalService(self.r,retriever,limit=1)
+  service.retrieve(7,77,Analysis()); service.retrieve(7,77,Analysis()); self.assertEqual(retriever.calls,1)
+  audit=' '.join(x[0] for x in self.r.connection.execute('SELECT metadata_json FROM audit_events').fetchall())
+  self.assertNotIn(body,audit); events=[x[0] for x in self.r.connection.execute('SELECT event_type FROM audit_events').fetchall()]; self.assertIn('knowledge_retrieval_started',events); self.assertIn('knowledge_retrieval_succeeded',events)
+  file.write_text('Changed shipping policy'); self.s.ingest_all(); self.assertNotEqual(first,self.r.knowledge_index_fingerprint('v1'))
+  service.retrieve(7,77,Analysis()); self.assertEqual(retriever.calls,2)

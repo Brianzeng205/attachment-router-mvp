@@ -43,75 +43,37 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
     try:
         repository = SqliteInboxRepository(settings.state_db_path)
         try:
-            ingestion_summary = MessageIngestionService(repository).ingest_all(messages)
-            if ingestion_summary.errors:
-                logging.getLogger(__name__).error(
-                    "Inbox ingestion completed with errors ingested=%s duplicates=%s errors=%s",
-                    ingestion_summary.ingested, ingestion_summary.duplicates, ingestion_summary.errors,
-                )
-            try:
-                analyzer = ClaudeInboxAnalyzer.from_settings(settings)
-                analysis_summary = InboxAnalysisService(
-                    repository, analyzer, analyzer_name=f"claude_inbox:{settings.inbox_analyzer_version}", model=settings.inbox_analyzer_model,
-                    prompt_version=settings.inbox_analyzer_prompt_version,
-                ).analyze_all(messages)
-                if analysis_summary.errors:
-                    logging.getLogger(__name__).error(
-                        "Inbox analysis completed with errors analyzed=%s skipped=%s errors=%s",
-                        analysis_summary.analyzed, analysis_summary.skipped, analysis_summary.errors,
-                    )
-            except Exception:
-                # Analysis is independent from the existing attachment-routing workflow.
-                logging.getLogger(__name__).exception("Inbox analysis path could not be initialised")
-            try:
-                conversation_analyzer = ClaudeConversationAnalyzer.from_settings(settings)
-                context_builder = ThreadContextBuilder(settings.max_thread_messages, settings.max_thread_context_chars,
-                                                       settings.thread_context_builder_version)
-                conversation_summary = ConversationAnalysisService(
-                    repository, context_builder, conversation_analyzer, analyzer_name="claude_conversation",
-                    analyzer_version=settings.conversation_analyzer_version, model=settings.conversation_analyzer_model,
-                    prompt_version=settings.conversation_analyzer_prompt_version,
-                ).analyze_all(repository.list_conversations())
-                if conversation_summary.errors:
-                    logging.getLogger(__name__).error(
-                        "Conversation analysis completed with errors analyzed=%s skipped=%s errors=%s",
-                        conversation_summary.analyzed, conversation_summary.skipped, conversation_summary.errors,
-                    )
-            except Exception:
-                logging.getLogger(__name__).exception("Conversation analysis path could not be initialised")
-            try:
-                KnowledgeIngestionService(repository, settings.knowledge_dir, settings.knowledge_chunk_max_chars,
-                    settings.knowledge_chunk_overlap_chars, settings.knowledge_index_version).ingest_all()
-                retrieval = KnowledgeRetrievalService(repository, SqliteKnowledgeRetriever(repository),
-                    limit=settings.knowledge_retrieval_limit, retriever_version=settings.knowledge_retriever_version,
-                    index_version=settings.knowledge_index_version)
-                for conversation in repository.list_conversations():
-                    persisted = repository.latest_successful_conversation_analysis(conversation.id)
-                    if persisted:
-                        analysis_id, analysis = persisted
-                        retrieval.retrieve(conversation.id, analysis_id, analysis)
-            except FileNotFoundError:
-                logging.getLogger(__name__).info("Knowledge directory is unavailable; retrieval skipped")
-            except Exception:
-                logging.getLogger(__name__).exception("Knowledge retrieval path failed")
+            ingestion = MessageIngestionService(repository)
+            inbox = InboxAnalysisService(repository, ClaudeInboxAnalyzer.from_settings(settings), analyzer_name=f"claude_inbox:{settings.inbox_analyzer_version}", model=settings.inbox_analyzer_model, prompt_version=settings.inbox_analyzer_prompt_version)
+            conversation = ConversationAnalysisService(repository, ThreadContextBuilder(settings.max_thread_messages, settings.max_thread_context_chars, settings.thread_context_builder_version), ClaudeConversationAnalyzer.from_settings(settings), analyzer_name="claude_conversation", analyzer_version=settings.conversation_analyzer_version, model=settings.conversation_analyzer_model, prompt_version=settings.conversation_analyzer_prompt_version)
+            try: KnowledgeIngestionService(repository, settings.knowledge_dir, settings.knowledge_chunk_max_chars, settings.knowledge_chunk_overlap_chars, settings.knowledge_index_version).ingest_all()
+            except FileNotFoundError: logging.getLogger(__name__).info("Knowledge directory is unavailable; retrieval skipped")
+            retrieval = KnowledgeRetrievalService(repository, SqliteKnowledgeRetriever(repository), limit=settings.knowledge_retrieval_limit, retriever_version=settings.knowledge_retriever_version, index_version=settings.knowledge_index_version)
+            processor = AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings)
+            return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, attachment_processor=processor)
         finally:
             repository.close()
     except Exception:
         # The existing attachment router remains independently operable.
         logging.getLogger(__name__).exception("Inbox persistence path could not be initialised")
-    processor = AttachmentProcessor(
-        _StaticEmailClient(messages),
-        build_classifier(settings),
-        build_drive(settings),
-        SqliteStateManager(settings.state_db_path),
-        settings,
-    )
-    summary = processor.process_all()
-    logging.getLogger(__name__).info(
-        "Polling cycle complete uploaded=%s skipped=%s errors=%s",
-        summary.uploaded, summary.skipped, summary.errors,
-    )
-    return summary
+    return AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings).process_all()
+
+
+def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox_analysis_service,
+                       conversation_analysis_service, knowledge_retrieval_service, attachment_processor):
+    """Injectable Phase-4 execution seam; services own analysis/retrieval policy."""
+    try:
+        message_ingestion_service.ingest_all(messages)
+        inbox_analysis_service.analyze_all(messages)
+        conversation_analysis_service.analyze_all(repository.list_conversations())
+        for conversation in repository.list_conversations():
+            persisted = repository.latest_successful_conversation_analysis(conversation.id)
+            if persisted:
+                analysis_id, analysis = persisted
+                knowledge_retrieval_service.retrieve(conversation.id, analysis_id, analysis)
+    except Exception:
+        logging.getLogger(__name__).exception("Inbox agent branch failed")
+    return attachment_processor.process_all()
 
 
 class _StaticEmailClient:
