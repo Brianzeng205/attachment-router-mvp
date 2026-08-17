@@ -17,6 +17,7 @@ from .errors import (
     GmailRateLimitError,
 )
 from .models import Attachment, EmailMessage
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 logger = logging.getLogger(__name__)
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -25,15 +26,22 @@ GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 class GmailClient:
     """Read-only Gmail polling adapter; it never changes mailbox state."""
 
-    def __init__(self, service: Any, search_query: str = "has:attachment", max_attachment_bytes: int = 10 * 1024 * 1024) -> None:
+    def __init__(
+        self, service: Any, search_query: str = "has:attachment",
+        max_attachment_bytes: int = 10 * 1024 * 1024, retry_policy: RetryPolicy | None = None,
+    ) -> None:
         self._service = service
         self._search_query = search_query
         self._max_attachment_bytes = max_attachment_bytes
+        self._retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "GmailClient":
         service = _build_service(settings.gmail_oauth_client_secrets_file, settings.gmail_oauth_token_file)
-        return cls(service, settings.gmail_search_query, settings.max_attachment_bytes)
+        return cls(
+            service, settings.gmail_search_query, settings.max_attachment_bytes,
+            policy_from_settings(settings),
+        )
 
     def list_messages(self) -> Iterable[EmailMessage]:
         try:
@@ -43,7 +51,12 @@ class GmailClient:
                     logger.warning("Skipping malformed Gmail message summary without an ID")
                     continue
                 try:
-                    raw = self._service.users().messages().get(userId="me", id=message_id, format="full").execute()
+                    raw = self._provider_call(
+                        lambda: self._service.users().messages().get(
+                            userId="me", id=message_id, format="full",
+                        ).execute(),
+                        "get_message",
+                    )
                     yield self._to_email_message(raw)
                 except Exception as exc:
                     error = self._map_error(exc, f"Could not retrieve Gmail message {message_id}", GmailMessageError)
@@ -57,9 +70,12 @@ class GmailClient:
         page_token: str | None = None
         while True:
             try:
-                response = self._service.users().messages().list(
-                    userId="me", q=self._search_query, pageToken=page_token,
-                ).execute()
+                response = self._provider_call(
+                    lambda: self._service.users().messages().list(
+                        userId="me", q=self._search_query, pageToken=page_token,
+                    ).execute(),
+                    "list_messages",
+                )
             except Exception as exc:
                 raise self._map_error(exc, "Could not list Gmail messages", GmailAPIError) from exc
             messages = response.get("messages", [])
@@ -120,9 +136,12 @@ class GmailClient:
         encoded = body.get("data")
         if not isinstance(encoded, str) and isinstance(remote_attachment_id, str) and remote_attachment_id:
             try:
-                result = self._service.users().messages().attachments().get(
-                    userId="me", messageId=message_id, id=remote_attachment_id,
-                ).execute()
+                result = self._provider_call(
+                    lambda: self._service.users().messages().attachments().get(
+                        userId="me", messageId=message_id, id=remote_attachment_id,
+                    ).execute(),
+                    "get_attachment",
+                )
                 encoded = result.get("data") if isinstance(result, dict) else None
             except Exception as exc:
                 raise self._map_error(exc, "Could not retrieve Gmail attachment", GmailAttachmentError) from exc
@@ -136,6 +155,12 @@ class GmailClient:
             logger.warning("Skipping oversized attachment message_id=%s attachment_id=%s size=%s limit=%s", message_id, attachment_id, len(content), self._max_attachment_bytes)
             return None
         return content
+
+    def _provider_call(self, operation, operation_name: str):
+        return self._retry_policy.execute(
+            operation, retry_if=is_transient_provider_error,
+            provider="gmail", operation_name=operation_name,
+        )
 
     @staticmethod
     def _map_error(exc: Exception, context: str, default: type[Exception]) -> Exception:

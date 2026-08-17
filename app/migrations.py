@@ -209,4 +209,36 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_policy_decisions_draft ON policy_decisions(reply_draft_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_pending ON human_review_items(status, created_at, id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_item ON human_review_events(review_item_id, id)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS runtime_runs (
+        id INTEGER PRIMARY KEY,
+        trigger_type TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('running','completed','partial','failed','interrupted','abandoned')),
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT,
+        error_class TEXT,
+        lock_outcome TEXT NOT NULL,
+        messages_polled INTEGER CHECK(messages_polled >= 0),
+        inbox_errors INTEGER CHECK(inbox_errors >= 0),
+        attachments_uploaded INTEGER CHECK(attachments_uploaded >= 0),
+        attachments_skipped INTEGER CHECK(attachments_skipped >= 0),
+        attachment_errors INTEGER CHECK(attachment_errors >= 0),
+        outcome_status TEXT CHECK(outcome_status IS NULL OR outcome_status = 'partial'),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+    runtime_columns = {row[1] for row in connection.execute("PRAGMA table_info(runtime_runs)").fetchall()}
+    for column_name in (
+        "messages_polled", "inbox_errors", "attachments_uploaded",
+        "attachments_skipped", "attachment_errors",
+    ):
+        if column_name not in runtime_columns:
+            connection.execute(
+                f"ALTER TABLE runtime_runs ADD COLUMN {column_name} INTEGER CHECK({column_name} >= 0)"
+            )
+    if "outcome_status" not in runtime_columns:
+        connection.execute(
+            "ALTER TABLE runtime_runs ADD COLUMN outcome_status TEXT "
+            "CHECK(outcome_status IS NULL OR outcome_status = 'partial')"
+        )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runtime_runs_status ON runtime_runs(status, id)")
     connection.commit()

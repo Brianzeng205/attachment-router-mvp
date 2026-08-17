@@ -10,6 +10,7 @@ from .analysis_models import PRIORITIES, RECOMMENDED_ACTIONS, URGENCIES
 from .config import Settings
 from .conversation_models import ConversationAnalysis, ConversationContext
 from .errors import ConversationAnalyzerAPIError, ConversationAnalyzerAuthenticationError, ConversationAnalyzerResponseError
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "conversation_analysis.txt"
 CONVERSATION_SCHEMA: dict[str, object] = {
@@ -33,9 +34,13 @@ CONVERSATION_SCHEMA: dict[str, object] = {
 
 
 class ClaudeConversationAnalyzer:
-    def __init__(self, client: Any, model: str, prompt: str | None = None) -> None:
+    def __init__(
+        self, client: Any, model: str, prompt: str | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
         self._client, self.model = client, model
         self._prompt = prompt or PROMPT_PATH.read_text(encoding="utf-8")
+        self._retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ClaudeConversationAnalyzer":
@@ -43,7 +48,14 @@ class ClaudeConversationAnalyzer:
             raise ConversationAnalyzerAuthenticationError("ANTHROPIC_API_KEY is required")
         try:
             from anthropic import Anthropic
-            return cls(Anthropic(api_key=settings.anthropic_api_key), settings.conversation_analyzer_model)
+            return cls(
+                Anthropic(
+                    api_key=settings.anthropic_api_key,
+                    timeout=settings.provider_request_timeout_seconds,
+                    max_retries=0,
+                ),
+                settings.conversation_analyzer_model, retry_policy=policy_from_settings(settings),
+            )
         except Exception as exc:
             raise ConversationAnalyzerAuthenticationError("Unable to initialise conversation analyzer client") from exc
 
@@ -57,9 +69,15 @@ class ClaudeConversationAnalyzer:
                          for item in context.messages],
         }
         try:
-            response = self._client.messages.create(model=self.model, max_tokens=900, system=self._prompt,
-                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                output_config={"format": {"type": "json_schema", "schema": CONVERSATION_SCHEMA}})
+            response = self._retry_policy.execute(
+                lambda: self._client.messages.create(
+                    model=self.model, max_tokens=900, system=self._prompt,
+                    messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                    output_config={"format": {"type": "json_schema", "schema": CONVERSATION_SCHEMA}},
+                ),
+                retry_if=is_transient_provider_error,
+                provider="claude", operation_name="conversation_analysis",
+            )
         except Exception as exc:
             raise ConversationAnalyzerAPIError("Conversation Analyzer API request failed") from exc
         content = getattr(response, "content", None) or []

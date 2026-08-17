@@ -15,6 +15,7 @@ from .errors import (
 )
 from .models import Attachment, Classification, EmailMessage
 from .text_extraction import extract_attachment_text
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "classify_document.txt"
 CLASSIFICATION_SCHEMA: dict[str, object] = {
@@ -43,6 +44,7 @@ class ClaudeDocumentClassifier:
         self, client: Any, model: str, allowed_folder_labels: set[str], max_extracted_text_chars: int = 12_000,
         extractor: Callable[[Attachment, int], str | None] = extract_attachment_text,
         prompt: str | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         if not allowed_folder_labels:
             raise ValueError("At least one logical destination label must be configured")
@@ -52,6 +54,7 @@ class ClaudeDocumentClassifier:
         self._max_extracted_text_chars = max_extracted_text_chars
         self._extractor = extractor
         self._prompt = prompt or PROMPT_PATH.read_text(encoding="utf-8")
+        self._retry_policy = retry_policy or RetryPolicy()
         self._schema = {
             **CLASSIFICATION_SCHEMA,
             "properties": {
@@ -67,10 +70,17 @@ class ClaudeDocumentClassifier:
         try:
             from anthropic import Anthropic
 
-            client = Anthropic(api_key=settings.anthropic_api_key)
+            client = Anthropic(
+                api_key=settings.anthropic_api_key,
+                timeout=settings.provider_request_timeout_seconds,
+                max_retries=0,
+            )
         except Exception as exc:
             raise ClassifierAuthenticationError(f"Unable to initialise Anthropic client: {exc}") from exc
-        return cls(client, settings.anthropic_model, set(settings.allowed_drive_folders), settings.max_extracted_text_chars)
+        return cls(
+            client, settings.anthropic_model, set(settings.allowed_drive_folders),
+            settings.max_extracted_text_chars, retry_policy=policy_from_settings(settings),
+        )
 
     def classify(self, message: EmailMessage, attachment: Attachment) -> Mapping[str, object]:
         extracted_text = self._safe_extract(attachment)
@@ -84,12 +94,16 @@ class ClaudeDocumentClassifier:
             "available_target_folder_labels": sorted(self._allowed_folder_labels),
         }
         try:
-            response = self._client.messages.create(
-                model=self._model,
-                max_tokens=500,
-                system=self._prompt.format(allowed_folder_labels=", ".join(sorted(self._allowed_folder_labels))),
-                messages=[{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
-                output_config={"format": {"type": "json_schema", "schema": self._schema}},
+            response = self._retry_policy.execute(
+                lambda: self._client.messages.create(
+                    model=self._model,
+                    max_tokens=500,
+                    system=self._prompt.format(allowed_folder_labels=", ".join(sorted(self._allowed_folder_labels))),
+                    messages=[{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+                    output_config={"format": {"type": "json_schema", "schema": self._schema}},
+                ),
+                retry_if=is_transient_provider_error,
+                provider="claude", operation_name="document_classification",
             )
         except Exception as exc:
             self._raise_api_error(exc)

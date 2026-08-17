@@ -15,13 +15,15 @@ from .knowledge_models import KnowledgeMatch
 from .reply_draft_models import PersistedReplyDraft, ReplyDraft, ReplyDraftRun
 from .policy_models import PolicyDecision
 from .review_models import HumanReviewEvent, HumanReviewItem, PersistedPolicyDecision
+from .runtime_models import PollCycleReport, RuntimeRun
 from .migrations import initialize_schema
+from .database import DEFAULT_SQLITE_BUSY_TIMEOUT_MS, connect_sqlite
 
 
 class SqliteInboxRepository:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, busy_timeout_ms: int = DEFAULT_SQLITE_BUSY_TIMEOUT_MS) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(database_path)
+        self.connection = connect_sqlite(database_path, busy_timeout_ms)
         self.connection.row_factory = sqlite3.Row
         initialize_schema(self.connection)
 
@@ -470,6 +472,68 @@ class SqliteInboxRepository:
             updated = self.connection.execute("SELECT * FROM human_review_items WHERE id=?", (review_item_id,)).fetchone()
             return _review_item_from_row(updated)
 
+    def mark_running_runtime_runs_abandoned(self) -> int:
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE runtime_runs SET status='abandoned', completed_at=CURRENT_TIMESTAMP
+                   WHERE status='running'"""
+            )
+            return cursor.rowcount
+
+    def create_runtime_run(self, *, trigger_type: str, instance_id: str, lock_outcome: str) -> RuntimeRun:
+        with self.connection:
+            cursor = self.connection.execute(
+                """INSERT INTO runtime_runs (trigger_type, instance_id, status, lock_outcome)
+                   VALUES (?, ?, 'running', ?)""", (trigger_type, instance_id, lock_outcome),
+            )
+            row = self.connection.execute("SELECT * FROM runtime_runs WHERE id=?", (cursor.lastrowid,)).fetchone()
+            return _runtime_run_from_row(row)
+
+    def finalize_runtime_run(
+        self, run_id: int, status: str, error_class: str | None = None,
+        report: PollCycleReport | None = None,
+    ) -> RuntimeRun:
+        if status not in {"completed", "partial", "failed", "interrupted"}:
+            raise ValueError("Invalid final runtime status")
+        if report is not None and status not in {"completed", "partial"}:
+            raise ValueError("Poll-cycle metrics apply only to normally returned runs")
+        metrics = (
+            (report.messages_polled, report.inbox_errors, report.attachments_uploaded,
+             report.attachments_skipped, report.attachment_errors)
+            if report else (None, None, None, None, None)
+        )
+        with self.connection:
+            parameters = (status, error_class, *metrics, run_id)
+            try:
+                cursor = self.connection.execute(
+                    """UPDATE runtime_runs SET status=?, outcome_status=NULL, error_class=?,
+                       completed_at=CURRENT_TIMESTAMP, messages_polled=?, inbox_errors=?,
+                       attachments_uploaded=?, attachments_skipped=?, attachment_errors=?
+                       WHERE id=? AND status='running'""", parameters,
+                )
+            except sqlite3.IntegrityError:
+                if status != "partial":
+                    raise
+                # Phase 7A databases have a status CHECK that predates `partial`.
+                cursor = self.connection.execute(
+                    """UPDATE runtime_runs SET status='completed', outcome_status='partial', error_class=?,
+                       completed_at=CURRENT_TIMESTAMP, messages_polled=?, inbox_errors=?,
+                       attachments_uploaded=?, attachments_skipped=?, attachment_errors=?
+                       WHERE id=? AND status='running'""", (error_class, *metrics, run_id),
+                )
+            if cursor.rowcount != 1:
+                raise ValueError("Runtime run is missing or no longer running")
+            row = self.connection.execute("SELECT * FROM runtime_runs WHERE id=?", (run_id,)).fetchone()
+            return _runtime_run_from_row(row)
+
+    def get_runtime_run(self, run_id: int) -> RuntimeRun | None:
+        row = self.connection.execute("SELECT * FROM runtime_runs WHERE id=?", (run_id,)).fetchone()
+        return _runtime_run_from_row(row) if row else None
+
+    def list_runtime_runs(self) -> list[RuntimeRun]:
+        rows = self.connection.execute("SELECT * FROM runtime_runs ORDER BY id ASC").fetchall()
+        return [_runtime_run_from_row(row) for row in rows]
+
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)
         if existing:
@@ -583,6 +647,15 @@ def _review_item_from_row(row: sqlite3.Row) -> HumanReviewItem:
 def _review_event_from_row(row: sqlite3.Row) -> HumanReviewEvent:
     return HumanReviewEvent(
         row["id"], row["review_item_id"], row["event_type"], row["reviewer_id"], row["note"], row["created_at"],
+    )
+
+
+def _runtime_run_from_row(row: sqlite3.Row) -> RuntimeRun:
+    return RuntimeRun(
+        row["id"], row["trigger_type"], row["instance_id"], row["outcome_status"] or row["status"], row["started_at"],
+        row["completed_at"], row["error_class"], row["lock_outcome"],
+        row["messages_polled"], row["inbox_errors"], row["attachments_uploaded"],
+        row["attachments_skipped"], row["attachment_errors"],
     )
 
 

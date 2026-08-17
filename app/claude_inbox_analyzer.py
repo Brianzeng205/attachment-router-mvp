@@ -10,6 +10,7 @@ from .analysis_models import CATEGORIES, PRIORITIES, RECOMMENDED_ACTIONS, URGENC
 from .config import Settings
 from .errors import InboxAnalyzerAPIError, InboxAnalyzerAuthenticationError, InboxAnalyzerResponseError
 from .inbox_models import InboxMessage
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "inbox_analysis.txt"
 ANALYSIS_SCHEMA: dict[str, object] = {
@@ -38,11 +39,15 @@ ANALYSIS_SCHEMA: dict[str, object] = {
 
 
 class ClaudeInboxAnalyzer:
-    def __init__(self, client: Any, model: str, max_body_chars: int, prompt: str | None = None) -> None:
+    def __init__(
+        self, client: Any, model: str, max_body_chars: int, prompt: str | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
         self._client = client
         self.model = model
         self.max_body_chars = max_body_chars
         self._prompt = prompt or PROMPT_PATH.read_text(encoding="utf-8")
+        self._retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ClaudeInboxAnalyzer":
@@ -50,8 +55,15 @@ class ClaudeInboxAnalyzer:
             raise InboxAnalyzerAuthenticationError("ANTHROPIC_API_KEY is required")
         try:
             from anthropic import Anthropic
-            return cls(Anthropic(api_key=settings.anthropic_api_key), settings.inbox_analyzer_model,
-                       settings.max_inbox_message_chars)
+            return cls(
+                Anthropic(
+                    api_key=settings.anthropic_api_key,
+                    timeout=settings.provider_request_timeout_seconds,
+                    max_retries=0,
+                ),
+                settings.inbox_analyzer_model, settings.max_inbox_message_chars,
+                retry_policy=policy_from_settings(settings),
+            )
         except InboxAnalyzerAuthenticationError:
             raise
         except Exception as exc:
@@ -65,12 +77,16 @@ class ClaudeInboxAnalyzer:
             "body_text": message.body_text[:self.max_body_chars],
         }
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=800,
-                system=self._prompt,
-                messages=[{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
-                output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+            response = self._retry_policy.execute(
+                lambda: self._client.messages.create(
+                    model=self.model,
+                    max_tokens=800,
+                    system=self._prompt,
+                    messages=[{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+                    output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+                ),
+                retry_if=is_transient_provider_error,
+                provider="claude", operation_name="inbox_analysis",
             )
         except Exception as exc:
             self._raise_api_error(exc)

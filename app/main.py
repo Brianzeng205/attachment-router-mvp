@@ -21,10 +21,13 @@ from .decision_policy import DefaultDecisionPolicy
 from .review_queue_service import ReviewQueueService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
+from .runtime_coordinator import RuntimeCoordinator
+from .runtime_models import PollCycleReport
 
 
 def build_state() -> SqliteStateManager:
-    return SqliteStateManager(Settings.from_env().state_db_path)
+    settings = Settings.from_env()
+    return SqliteStateManager(settings.state_db_path, settings.sqlite_busy_timeout_ms)
 
 
 def build_drive(settings: Settings | None = None) -> GoogleDriveClient:
@@ -41,12 +44,13 @@ def build_email(settings: Settings | None = None) -> GmailClient:
     return GmailClient.from_settings(settings or Settings.from_env())
 
 
-def run_once(settings: Settings | None = None) -> ProcessingSummary:
+def run_once(settings: Settings | None = None) -> PollCycleReport:
     settings = settings or Settings.from_env()
     email = build_email(settings)
     messages = tuple(email.list_messages())
+    cycle_started = False
     try:
-        repository = SqliteInboxRepository(settings.state_db_path)
+        repository = SqliteInboxRepository(settings.state_db_path, settings.sqlite_busy_timeout_ms)
         try:
             ingestion = MessageIngestionService(repository)
             inbox = InboxAnalysisService(repository, ClaudeInboxAnalyzer.from_settings(settings), analyzer_name=f"claude_inbox:{settings.inbox_analyzer_version}", model=settings.inbox_analyzer_model, prompt_version=settings.inbox_analyzer_prompt_version)
@@ -66,25 +70,37 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
                 "min_draft_confidence": decision_policy.min_draft_confidence,
                 "min_conversation_confidence": decision_policy.min_conversation_confidence,
             })
-            processor = AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings)
+            processor = AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path, settings.sqlite_busy_timeout_ms), settings)
+            cycle_started = True
             return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, reply_draft_service=drafting, thread_context_builder=context_builder, decision_policy=decision_policy, review_queue_service=review_queue, attachment_processor=processor)
         finally:
             repository.close()
     except Exception:
+        if cycle_started:
+            raise
         # The existing attachment router remains independently operable.
         logging.getLogger(__name__).exception("Inbox persistence path could not be initialised")
-    return AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings).process_all()
+    attachment_summary = AttachmentProcessor(
+        _StaticEmailClient(messages), build_classifier(settings), build_drive(settings),
+        SqliteStateManager(settings.state_db_path, settings.sqlite_busy_timeout_ms), settings,
+    ).process_all()
+    return _poll_cycle_report(len(messages), 1, attachment_summary)
 
 
 def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox_analysis_service,
                        conversation_analysis_service, knowledge_retrieval_service, attachment_processor,
                        reply_draft_service=None, thread_context_builder=None,
                        decision_policy=None, review_queue_service=None):
-    """Injectable Phase-6 seam; domain services own policy rules and persistence idempotency."""
+    """Injectable workflow returning content-free operational counts for the cycle."""
+    messages = tuple(messages)
+    inbox_errors = 0
     try:
-        message_ingestion_service.ingest_all(messages)
-        inbox_analysis_service.analyze_all(messages)
-        conversation_analysis_service.analyze_all(repository.list_conversations())
+        ingestion_summary = message_ingestion_service.ingest_all(messages)
+        inbox_errors += _summary_errors(ingestion_summary)
+        analysis_summary = inbox_analysis_service.analyze_all(messages)
+        inbox_errors += _summary_errors(analysis_summary)
+        conversation_summary = conversation_analysis_service.analyze_all(repository.list_conversations())
+        inbox_errors += _summary_errors(conversation_summary)
         for conversation in repository.list_conversations():
             persisted = repository.latest_successful_conversation_analysis(conversation.id)
             if persisted:
@@ -103,6 +119,9 @@ def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox
                             ReplyDraftInput.from_context(context, analysis, retrieval_run_id, matches),
                             conversation_analysis_id=analysis_id,
                         )
+                        if getattr(draft_outcome, "failed", False):
+                            inbox_errors += 1
+                            continue
                         if decision_policy and review_queue_service and draft_outcome.draft:
                             persisted_draft = draft_outcome.draft
                             draft_fingerprint = repository.get_reply_draft_run_fingerprint(persisted_draft.draft_run_id)
@@ -117,10 +136,30 @@ def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox
                                 decision=policy_decision,
                             )
                     except Exception:
+                        inbox_errors += 1
                         logging.getLogger(__name__).exception("Local drafting/policy/review failed conversation_id=%s", conversation.id)
     except Exception:
+        inbox_errors += 1
         logging.getLogger(__name__).exception("Inbox agent branch failed")
-    return attachment_processor.process_all()
+    attachment_summary = attachment_processor.process_all()
+    return _poll_cycle_report(len(messages), inbox_errors, attachment_summary)
+
+
+def _summary_errors(summary) -> int:
+    errors = getattr(summary, "errors", 0)
+    return errors if type(errors) is int and errors >= 0 else 0
+
+
+def _poll_cycle_report(
+    messages_polled: int, inbox_errors: int, attachment_summary: ProcessingSummary,
+) -> PollCycleReport:
+    return PollCycleReport(
+        messages_polled=messages_polled,
+        inbox_errors=inbox_errors,
+        attachments_uploaded=attachment_summary.uploaded,
+        attachments_skipped=attachment_summary.skipped,
+        attachment_errors=attachment_summary.errors,
+    )
 
 
 class _StaticEmailClient:
@@ -133,10 +172,26 @@ class _StaticEmailClient:
         return self._messages
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """Stable one-shot CLI entrypoint; recurring scheduling remains external."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        run_once()
+        settings = Settings.from_env()
+        coordinator = RuntimeCoordinator(
+            settings.state_db_path, lambda: run_once(settings), trigger_type="cli",
+            sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
+        )
+        result = coordinator.execute_once()
+        if result.status == "skipped_locked":
+            logging.getLogger(__name__).info("Polling cycle skipped because another worker owns the lock")
+        return 0
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).warning("Polling cycle interrupted")
+        return 130
     except Exception:
         logging.getLogger(__name__).exception("Polling cycle failed")
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

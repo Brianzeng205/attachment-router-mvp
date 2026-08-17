@@ -19,6 +19,12 @@ A small Python MVP that polls Gmail, classifies email attachments, and routes th
 - `GmailClient` polls a configured Gmail search query using read-only OAuth and supports multiple attachments per message.
 - `python -m app.main` composes Gmail, Claude, Drive, and SQLite for one complete polling cycle. Schedule it externally with Task Scheduler or cron if required.
 
+## Scheduled Windows deployment
+
+Production polling remains a one-shot command owned by Windows Task Scheduler; the Python application contains no recurring loop. The recommended initial interval is every five minutes, with Task Scheduler configured to **Do not start a new instance** and the application advisory lock retained as defense in depth.
+
+See [Scheduled Windows deployment](docs/windows-task-scheduler.md) for the exact program, arguments, working directory, exit semantics, 30-minute maximum-runtime recommendation, crash recovery, operational verification, retry ownership, and the known Google transport-timeout limitation.
+
 ## Configuration
 
 `ALLOWED_DRIVE_FOLDERS` is a JSON map from a classifier `target_folder` name to a Google Drive folder ID. Claude can never select a folder outside that map. The Needs Review folder is separately configured. The Drive client accepts only IDs in these two configuration values; it never creates folders.

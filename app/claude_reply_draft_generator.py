@@ -10,6 +10,7 @@ from .config import Settings
 from .errors import ReplyDraftGeneratorAPIError, ReplyDraftGeneratorAuthenticationError, ReplyDraftGeneratorResponseError
 from .reply_draft_input import ReplyDraftInput
 from .reply_draft_models import DRAFT_STATUSES, ReplyDraft
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "grounded_reply.txt"
@@ -35,13 +36,17 @@ REPLY_DRAFT_SCHEMA: dict[str, object] = {
 
 
 class ClaudeGroundedReplyGenerator:
-    def __init__(self, client: Any, model: str, prompt: str | None = None, *, maximum_body_chars: int = 4_000) -> None:
+    def __init__(
+        self, client: Any, model: str, prompt: str | None = None, *, maximum_body_chars: int = 4_000,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
         if maximum_body_chars < 1:
             raise ValueError("maximum_body_chars must be positive")
         self._client = client
         self.model = model
         self._prompt = prompt or PROMPT_PATH.read_text(encoding="utf-8")
         self._maximum_body_chars = maximum_body_chars
+        self._retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ClaudeGroundedReplyGenerator":
@@ -49,18 +54,29 @@ class ClaudeGroundedReplyGenerator:
             raise ReplyDraftGeneratorAuthenticationError("ANTHROPIC_API_KEY is required")
         try:
             from anthropic import Anthropic
-            return cls(Anthropic(api_key=settings.anthropic_api_key), settings.reply_draft_generator_model)
+            return cls(
+                Anthropic(
+                    api_key=settings.anthropic_api_key,
+                    timeout=settings.provider_request_timeout_seconds,
+                    max_retries=0,
+                ),
+                settings.reply_draft_generator_model, retry_policy=policy_from_settings(settings),
+            )
         except Exception as exc:
             raise ReplyDraftGeneratorAuthenticationError("Unable to initialise grounded reply generator client") from exc
 
     def generate(self, draft_input: ReplyDraftInput) -> ReplyDraft:
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=1_200,
-                system=self._prompt,
-                messages=[{"role": "user", "content": json.dumps(_payload(draft_input), ensure_ascii=False)}],
-                output_config={"format": {"type": "json_schema", "schema": REPLY_DRAFT_SCHEMA}},
+            response = self._retry_policy.execute(
+                lambda: self._client.messages.create(
+                    model=self.model,
+                    max_tokens=1_200,
+                    system=self._prompt,
+                    messages=[{"role": "user", "content": json.dumps(_payload(draft_input), ensure_ascii=False)}],
+                    output_config={"format": {"type": "json_schema", "schema": REPLY_DRAFT_SCHEMA}},
+                ),
+                retry_if=is_transient_provider_error,
+                provider="claude", operation_name="grounded_reply",
             )
         except Exception as exc:
             raise ReplyDraftGeneratorAPIError("Grounded reply generator API request failed") from exc

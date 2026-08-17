@@ -12,14 +12,16 @@ from app.knowledge_models import KnowledgeMatch
 from app.decision_policy import DefaultDecisionPolicy
 from app.policy_models import PolicyDecision
 from app.reply_draft_models import PersistedReplyDraft, ReplyDraft
+from app.orchestrator import ProcessingSummary
+from app.runtime_models import PollCycleReport
 
 class S:
- def __init__(self, fail=False): self.calls=0; self.fail=fail
+ def __init__(self, fail=False, attachment_summary=None): self.calls=0; self.fail=fail; self.attachment_summary=attachment_summary or ProcessingSummary(uploaded=1)
  def ingest_all(self,x): self.calls+=1
  def analyze_all(self,x):
   self.calls+=1
   if self.fail: raise RuntimeError('failed')
- def process_all(self): self.calls+=1; return 'attachment-summary'
+ def process_all(self): self.calls+=1; return self.attachment_summary
 
 class Repo:
  def __init__(self, analysis=True): self.analysis=analysis; self.conversation=type('C',(),{'id':1})()
@@ -85,31 +87,31 @@ class RuntimeTests(unittest.TestCase):
   msg=EmailMessage('m','s','x','b','t',(Attachment('a','a.txt',b'x'),),'t')
   attach=S(); result=process_poll_cycle(messages=[msg],repository=repo or Repo(),message_ingestion_service=S(),inbox_analysis_service=S(),conversation_analysis_service=convo or S(),knowledge_retrieval_service=retrieval or Retrieval(),reply_draft_service=drafting,thread_context_builder=builder,decision_policy=policy,review_queue_service=review,attachment_processor=attach); return result,attach
  def test_success_analysis_triggers_retrieval_and_stops(self):
-  r=Retrieval(); result,attach=self.execute_cycle(retrieval=r); self.assertEqual(r.calls,[(1,7,'validated-analysis')]); self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1)
+  r=Retrieval(); result,attach=self.execute_cycle(retrieval=r); self.assertEqual(r.calls,[(1,7,'validated-analysis')]); self.assertEqual(result,PollCycleReport(1,0,1,0,0)); self.assertEqual(attach.calls,1)
  def test_missing_analysis_blocks_retrieval(self):
-  r=Retrieval(); draft=Drafting(); self.execute_cycle(repo=Repo(False),retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(r.calls,[]); self.assertEqual(draft.calls,[])
+  r=Retrieval(); draft=Drafting(); report,_=self.execute_cycle(repo=Repo(False),retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(r.calls,[]); self.assertEqual(draft.calls,[]); self.assertFalse(report.has_partial_failures)
  def test_failed_analysis_blocks_retrieval_and_keeps_attachment_path(self):
-  r=Retrieval(); draft=Drafting(); _,attach=self.execute_cycle(convo=S(True),retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(r.calls,[]); self.assertEqual(draft.calls,[]); self.assertEqual(attach.calls,1)
+  r=Retrieval(); draft=Drafting(); report,attach=self.execute_cycle(convo=S(True),retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(r.calls,[]); self.assertEqual(draft.calls,[]); self.assertEqual(attach.calls,1); self.assertEqual(report.inbox_errors,1)
  def test_retrieval_failure_keeps_attachment_path(self):
-  r=Retrieval(True); draft=Drafting(); _,attach=self.execute_cycle(retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(len(r.calls),1); self.assertEqual(draft.calls,[]); self.assertEqual(attach.calls,1)
+  r=Retrieval(True); draft=Drafting(); report,attach=self.execute_cycle(retrieval=r,drafting=draft,builder=Builder()); self.assertEqual(len(r.calls),1); self.assertEqual(draft.calls,[]); self.assertEqual(attach.calls,1); self.assertEqual(report.inbox_errors,1)
  def test_zero_result_runtime_is_terminal(self):
-  r=Retrieval(zero=True); result,attach=self.execute_cycle(retrieval=r); self.assertEqual(len(r.calls),1); self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1)
+  r=Retrieval(zero=True); result,attach=self.execute_cycle(retrieval=r); self.assertEqual(len(r.calls),1); self.assertEqual(result,PollCycleReport(1,0,1,0,0)); self.assertEqual(attach.calls,1)
  def test_successful_retrieval_invokes_drafting_with_bounded_persisted_state_and_stops(self):
   match=KnowledgeMatch(11,2,'policy.md',None,'approved knowledge',.8,1); repo=DraftRepo(matches=[match]); draft=Drafting(); builder=Builder()
   result,attach=self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=draft,builder=builder)
-  self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1); self.assertEqual(len(draft.calls),1)
+  self.assertEqual(result,PollCycleReport(1,0,1,0,0)); self.assertEqual(attach.calls,1); self.assertEqual(len(draft.calls),1)
   draft_input,analysis_id=draft.calls[0]
   self.assertEqual((analysis_id,draft_input.conversation_id,draft_input.latest_message_id,draft_input.knowledge_retrieval_run_id),(7,1,3,19))
   self.assertEqual((draft_input.context_fingerprint,draft_input.allowed_grounding_chunk_ids),('context-fingerprint',frozenset({11})))
   self.assertEqual(draft_input.knowledge_matches[0].chunk_text,'approved knowledge')
  def test_zero_result_retrieval_reaches_drafting_for_local_insufficient_knowledge_path(self):
   draft=Drafting(); result,attach=self.execute_cycle(repo=DraftRepo(matches=[]),retrieval=Retrieval(),drafting=draft,builder=Builder())
-  self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1); self.assertEqual(len(draft.calls),1)
+  self.assertEqual(result,PollCycleReport(1,0,1,0,0)); self.assertEqual(attach.calls,1); self.assertEqual(len(draft.calls),1)
   self.assertEqual(draft.calls[0][0].knowledge_matches,())
  def test_drafting_failure_keeps_retrieval_state_and_attachment_path_independent(self):
   retrieval=Retrieval(); draft=Drafting(True); repo=DraftRepo(matches=[KnowledgeMatch(11,2,'policy.md',None,'approved knowledge',.8,1)])
-  _,attach=self.execute_cycle(repo=repo,retrieval=retrieval,drafting=draft,builder=Builder())
-  self.assertEqual(len(retrieval.calls),1); self.assertEqual(len(draft.calls),1); self.assertEqual(attach.calls,1)
+  report,attach=self.execute_cycle(repo=repo,retrieval=retrieval,drafting=draft,builder=Builder())
+  self.assertEqual(len(retrieval.calls),1); self.assertEqual(len(draft.calls),1); self.assertEqual(attach.calls,1); self.assertEqual(report.inbox_errors,1)
  def test_policy_decision_flows_create_only_expected_pending_local_review_state(self):
   cases=(
    (ReplyDraft('drafted','Re','Safe reply',(11,),(),.9,False,None,'en'),'ready_for_review','standard_review'),
@@ -121,7 +123,7 @@ class RuntimeTests(unittest.TestCase):
    with self.subTest(decision=expected):
     repo=DraftRepo(matches=[KnowledgeMatch(11,2,'policy.md',None,'approved knowledge',.8,1)]); drafting=Drafting(reply=reply); policy=Policy(); review=Review()
     result,attach=self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
-    self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1); self.assertEqual(len(policy.calls),1); self.assertEqual(len(review.calls),1)
+    self.assertEqual(result,PollCycleReport(1,0,1,0,0)); self.assertEqual(attach.calls,1); self.assertEqual(len(policy.calls),1); self.assertEqual(len(review.calls),1)
     self.assertIs(policy.calls[0]['conversation_analysis'],repo.analysis_value); self.assertIs(policy.calls[0]['reply_draft'],reply)
     self.assertEqual(review.calls[0]['decision'].decision,expected)
     outcome=next(iter(review.rows.values())); self.assertEqual(outcome.review_item.review_type if outcome.review_item else None,review_type)
@@ -140,10 +142,11 @@ class RuntimeTests(unittest.TestCase):
  def test_policy_or_review_failure_preserves_local_draft_and_attachment_independence(self):
   for policy,review in ((Policy(True),Review()),(Policy(),Review(True))):
    with self.subTest(policy_failure=policy.fail,review_failure=review.fail):
-    drafting=Drafting(); _,attach=self.execute_cycle(repo=DraftRepo(matches=[]),retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
+    drafting=Drafting(); report,attach=self.execute_cycle(repo=DraftRepo(matches=[]),retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
     self.assertEqual(len(drafting.calls),1); self.assertEqual(attach.calls,1)
     self.assertEqual(len(policy.calls),1)
     self.assertEqual(len(review.calls),0 if policy.fail else 1)
+    self.assertEqual(report.inbox_errors,1)
  def test_repeated_runtime_relies_on_review_service_idempotency_and_never_auto_resolves(self):
   repo=DraftRepo(matches=[]); drafting=Drafting(); policy=Policy(); review=Review()
   for _ in range(2): self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
@@ -153,7 +156,16 @@ class RuntimeTests(unittest.TestCase):
    settings=Settings(.85,'review',{'x':'folder'},Path(directory)/'state.sqlite3',anthropic_api_key='test')
    email=type('Email',(),{'list_messages':lambda self: ()})()
    called=[]
-   with patch.object(runtime,'build_email',return_value=email), patch.object(runtime,'ClaudeInboxAnalyzer'), patch.object(runtime,'ClaudeConversationAnalyzer'), patch.object(runtime,'ClaudeGroundedReplyGenerator'), patch.object(runtime,'SqliteStateManager'), patch.object(runtime,'build_classifier'), patch.object(runtime,'build_drive'), patch.object(runtime,'process_poll_cycle',side_effect=lambda **kwargs: called.append(kwargs) or 'summary'):
+   report=PollCycleReport()
+   with patch.object(runtime,'build_email',return_value=email), patch.object(runtime,'ClaudeInboxAnalyzer'), patch.object(runtime,'ClaudeConversationAnalyzer'), patch.object(runtime,'ClaudeGroundedReplyGenerator'), patch.object(runtime,'SqliteStateManager'), patch.object(runtime,'build_classifier'), patch.object(runtime,'build_drive'), patch.object(runtime,'process_poll_cycle',side_effect=lambda **kwargs: called.append(kwargs) or report):
     with patch.object(runtime.ClaudeInboxAnalyzer,'from_settings',return_value=object()), patch.object(runtime.ClaudeConversationAnalyzer,'from_settings',return_value=object()), patch.object(runtime.ClaudeGroundedReplyGenerator,'from_settings',return_value=object()):
-     self.assertEqual(runtime.run_once(settings),'summary')
+     self.assertIs(runtime.run_once(settings),report)
    self.assertEqual(len(called),1)
+ def test_run_once_propagates_unhandled_poll_cycle_failure(self):
+  with tempfile.TemporaryDirectory() as directory:
+   settings=Settings(.85,'review',{'x':'folder'},Path(directory)/'state.sqlite3',anthropic_api_key='test')
+   email=type('Email',(),{'list_messages':lambda self: ()})()
+   with patch.object(runtime,'build_email',return_value=email), patch.object(runtime,'ClaudeInboxAnalyzer'), patch.object(runtime,'ClaudeConversationAnalyzer'), patch.object(runtime,'ClaudeGroundedReplyGenerator'), patch.object(runtime,'SqliteStateManager'), patch.object(runtime,'build_classifier'), patch.object(runtime,'build_drive'), patch.object(runtime,'process_poll_cycle',side_effect=RuntimeError('cycle failed')):
+    with patch.object(runtime.ClaudeInboxAnalyzer,'from_settings',return_value=object()), patch.object(runtime.ClaudeConversationAnalyzer,'from_settings',return_value=object()), patch.object(runtime.ClaudeGroundedReplyGenerator,'from_settings',return_value=object()):
+     with self.assertRaisesRegex(RuntimeError,'cycle failed'):
+      runtime.run_once(settings)

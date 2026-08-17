@@ -74,9 +74,10 @@ class ClaudeGroundedReplyGeneratorTests(unittest.TestCase):
     def test_fabricated_and_duplicate_grounding_ids_are_rejected(self):
         for value in (draft_payload(grounding_chunk_ids=[11, 999]), draft_payload(grounding_chunk_ids=[11, 11])):
             with self.subTest(value=value):
-                generator, _ = self.generator(value)
+                generator, client = self.generator(value)
                 with self.assertRaises(ReplyDraftGeneratorResponseError):
                     generator.generate(self.input())
+                self.assertEqual(len(client.messages.requests), 1)
 
     def test_invalid_status_confidence_missing_fields_and_malformed_json_are_rejected(self):
         values = (

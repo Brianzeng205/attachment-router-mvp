@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,13 @@ class Settings:
     reply_draft_generator_model: str = "claude-haiku-4-5"
     reply_draft_generator_version: str = "v1"
     reply_draft_prompt_version: str = "v1"
+    provider_retry_max_attempts: int = 3
+    provider_retry_initial_delay_seconds: float = 0.5
+    provider_retry_max_delay_seconds: float = 5.0
+    provider_retry_multiplier: float = 2.0
+    provider_retry_jitter_ratio: float = 0.1
+    provider_request_timeout_seconds: float = 30.0
+    sqlite_busy_timeout_ms: int = 5_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +96,32 @@ class Settings:
             raise ValueError("MAX_THREAD_MESSAGES must be between 1 and 100")
         if max_thread_context_chars < 100 or max_thread_context_chars > 200_000:
             raise ValueError("MAX_THREAD_CONTEXT_CHARS must be between 100 and 200000")
+        try:
+            retry_max_attempts = int(os.environ.get("PROVIDER_RETRY_MAX_ATTEMPTS", "3"))
+            retry_initial_delay = float(os.environ.get("PROVIDER_RETRY_INITIAL_DELAY_SECONDS", "0.5"))
+            retry_max_delay = float(os.environ.get("PROVIDER_RETRY_MAX_DELAY_SECONDS", "5"))
+            retry_multiplier = float(os.environ.get("PROVIDER_RETRY_MULTIPLIER", "2"))
+            retry_jitter_ratio = float(os.environ.get("PROVIDER_RETRY_JITTER_RATIO", "0.1"))
+            request_timeout = float(os.environ.get("PROVIDER_REQUEST_TIMEOUT_SECONDS", "30"))
+            sqlite_busy_timeout_ms = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+        except ValueError as exc:
+            raise ValueError("Retry and timeout settings must be numeric") from exc
+        if retry_max_attempts < 1 or retry_max_attempts > 10:
+            raise ValueError("PROVIDER_RETRY_MAX_ATTEMPTS must be between 1 and 10")
+        if not all(math.isfinite(value) for value in (
+            retry_initial_delay, retry_max_delay, retry_multiplier, retry_jitter_ratio, request_timeout,
+        )):
+            raise ValueError("Retry and timeout settings must be finite")
+        if retry_initial_delay < 0 or retry_max_delay < retry_initial_delay or retry_max_delay > 60:
+            raise ValueError("Provider retry delays are invalid")
+        if retry_multiplier < 1 or retry_multiplier > 10:
+            raise ValueError("PROVIDER_RETRY_MULTIPLIER must be between 1 and 10")
+        if not 0 <= retry_jitter_ratio <= 1:
+            raise ValueError("PROVIDER_RETRY_JITTER_RATIO must be between 0 and 1")
+        if request_timeout <= 0 or request_timeout > 300:
+            raise ValueError("PROVIDER_REQUEST_TIMEOUT_SECONDS must be between 0 and 300")
+        if sqlite_busy_timeout_ms < 0 or sqlite_busy_timeout_ms > 60_000:
+            raise ValueError("SQLITE_BUSY_TIMEOUT_MS must be between 0 and 60000")
         return cls(
             threshold,
             review_folder,
@@ -117,6 +151,8 @@ class Settings:
             int(os.environ.get("KNOWLEDGE_RETRIEVAL_LIMIT", "5")), os.environ.get("KNOWLEDGE_RETRIEVER_VERSION", "v1"), os.environ.get("KNOWLEDGE_INDEX_VERSION", "v1"),
             os.environ.get("REPLY_DRAFT_GENERATOR_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")),
             os.environ.get("REPLY_DRAFT_GENERATOR_VERSION", "v1"), os.environ.get("REPLY_DRAFT_PROMPT_VERSION", "v1"),
+            retry_max_attempts, retry_initial_delay, retry_max_delay, retry_multiplier, retry_jitter_ratio,
+            request_timeout, sqlite_busy_timeout_ms,
         )
 
     @property

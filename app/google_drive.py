@@ -11,6 +11,7 @@ from .errors import (
     DriveUploadError,
 )
 from .filenames import validate_upload_filename
+from .retry import RetryPolicy, is_transient_provider_error, policy_from_settings
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -19,14 +20,21 @@ FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 class GoogleDriveClient:
     """Single-user Google Drive adapter with a configured folder allowlist."""
 
-    def __init__(self, service: Any, allowed_folder_ids: set[str], media_factory: Any | None = None) -> None:
+    def __init__(
+        self, service: Any, allowed_folder_ids: set[str], media_factory: Any | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
         self._service = service
         self._allowed_folder_ids = frozenset(allowed_folder_ids)
         self._media_factory = media_factory or _media_upload
+        self._retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "GoogleDriveClient":
-        return cls(_build_service(settings.google_oauth_client_secrets_file, settings.google_oauth_token_file), settings.allowed_drive_folder_ids)
+        return cls(
+            _build_service(settings.google_oauth_client_secrets_file, settings.google_oauth_token_file),
+            settings.allowed_drive_folder_ids, retry_policy=policy_from_settings(settings),
+        )
 
     def upload(
         self, *, folder_id: str, filename: str, content: bytes,
@@ -37,32 +45,27 @@ class GoogleDriveClient:
         validate_upload_filename(filename)
         self._assert_folder(folder_id)
 
-        existing = self._find_existing(folder_id, idempotency_key)
-        if existing:
-            return existing
-
         try:
-            media = self._media_factory(content, mime_type or "application/octet-stream")
-            created = self._service.files().create(
-                body={
-                    "name": self._deduplicated_filename(filename, idempotency_key),
-                    "parents": [folder_id],
-                    "appProperties": {"attachment_router_key": idempotency_key},
-                },
-                media_body=media,
-                fields="id,name",
-                supportsAllDrives=True,
-            ).execute()
-            return created["id"]
+            return self._retry_policy.execute(
+                lambda: self._upload_or_recover_once(
+                    folder_id, filename, content, mime_type, idempotency_key,
+                ),
+                retry_if=is_transient_provider_error,
+                provider="drive", operation_name="upload_or_recover",
+            )
         except Exception as exc:
             self._raise_drive_error(exc, "Upload failed")
             raise AssertionError("unreachable")
 
     def _assert_folder(self, folder_id: str) -> None:
         try:
-            metadata = self._service.files().get(
-                fileId=folder_id, fields="id,name,mimeType,trashed", supportsAllDrives=True,
-            ).execute()
+            metadata = self._retry_policy.execute(
+                lambda: self._service.files().get(
+                    fileId=folder_id, fields="id,name,mimeType,trashed", supportsAllDrives=True,
+                ).execute(),
+                retry_if=is_transient_provider_error,
+                provider="drive", operation_name="get_folder",
+            )
         except Exception as exc:
             self._raise_drive_error(exc, "Unable to access configured folder")
             return
@@ -71,22 +74,38 @@ class GoogleDriveClient:
         if metadata.get("mimeType") != FOLDER_MIME_TYPE:
             raise DriveFolderError("Configured destination is not a Google Drive folder")
 
-    def _find_existing(self, folder_id: str, idempotency_key: str) -> str | None:
+    def _upload_or_recover_once(
+        self, folder_id: str, filename: str, content: bytes,
+        mime_type: str | None, idempotency_key: str,
+    ) -> str:
+        existing = self._find_existing_once(folder_id, idempotency_key)
+        if existing:
+            return existing
+        media = self._media_factory(content, mime_type or "application/octet-stream")
+        created = self._service.files().create(
+            body={
+                "name": self._deduplicated_filename(filename, idempotency_key),
+                "parents": [folder_id],
+                "appProperties": {"attachment_router_key": idempotency_key},
+            },
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        return created["id"]
+
+    def _find_existing_once(self, folder_id: str, idempotency_key: str) -> str | None:
         safe_key = idempotency_key.replace("'", "\\'")
         query = (
             f"'{folder_id}' in parents and trashed = false and "
             f"appProperties has {{ key='attachment_router_key' and value='{safe_key}' }}"
         )
-        try:
-            response = self._service.files().list(
-                q=query, spaces="drive", fields="files(id,name)", pageSize=1,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute()
-            files = response.get("files", [])
-            return files[0]["id"] if files else None
-        except Exception as exc:
-            self._raise_drive_error(exc, "Could not check existing upload")
-            raise AssertionError("unreachable")
+        response = self._service.files().list(
+            q=query, spaces="drive", fields="files(id,name)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        files = response.get("files", [])
+        return files[0]["id"] if files else None
 
     @staticmethod
     def _raise_drive_error(exc: Exception, context: str) -> None:
