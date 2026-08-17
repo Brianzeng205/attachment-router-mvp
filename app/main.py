@@ -12,6 +12,8 @@ from .inbox_analysis_service import InboxAnalysisService
 from .conversation_analysis_service import ConversationAnalysisService
 from .message_ingestion import MessageIngestionService
 from .thread_context import ThreadContextBuilder
+from .knowledge import KnowledgeIngestionService, SqliteKnowledgeRetriever
+from .knowledge_retrieval_service import KnowledgeRetrievalService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
 
@@ -77,6 +79,21 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
                     )
             except Exception:
                 logging.getLogger(__name__).exception("Conversation analysis path could not be initialised")
+            try:
+                KnowledgeIngestionService(repository, settings.knowledge_dir, settings.knowledge_chunk_max_chars,
+                    settings.knowledge_chunk_overlap_chars, settings.knowledge_index_version).ingest_all()
+                retrieval = KnowledgeRetrievalService(repository, SqliteKnowledgeRetriever(repository),
+                    limit=settings.knowledge_retrieval_limit, retriever_version=settings.knowledge_retriever_version,
+                    index_version=settings.knowledge_index_version)
+                for conversation in repository.list_conversations():
+                    persisted = repository.latest_successful_conversation_analysis(conversation.id)
+                    if persisted:
+                        analysis_id, analysis = persisted
+                        retrieval.retrieve(conversation.id, analysis_id, analysis)
+            except FileNotFoundError:
+                logging.getLogger(__name__).info("Knowledge directory is unavailable; retrieval skipped")
+            except Exception:
+                logging.getLogger(__name__).exception("Knowledge retrieval path failed")
         finally:
             repository.close()
     except Exception:

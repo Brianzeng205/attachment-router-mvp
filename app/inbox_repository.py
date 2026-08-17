@@ -11,6 +11,7 @@ from .inbox_models import AuditEvent, Conversation, InboxMessage
 from .inbox_models import AnalysisRun
 from .analysis_models import InboxAnalysis
 from .conversation_models import ConversationAnalysis, ConversationAnalysisRun
+from .knowledge_models import KnowledgeMatch
 from .migrations import initialize_schema
 
 
@@ -190,6 +191,55 @@ class SqliteInboxRepository:
                 """UPDATE conversation_analysis_runs SET status = 'failed', error_class = ?,
                    completed_at = CURRENT_TIMESTAMP WHERE id = ?""", (error_class, run.id),
             )
+
+    def upsert_knowledge(self, source_key, filename, text, content_hash, chunks, index_version):
+        with self.connection:
+            row=self.connection.execute("SELECT id,content_hash FROM knowledge_documents WHERE source_key=?",(source_key,)).fetchone()
+            if row and row["content_hash"] == content_hash: return row["id"]
+            if row:
+                doc_id=row["id"]; self.connection.execute("UPDATE knowledge_documents SET content_hash=?,source_filename=?,active=1,updated_at=CURRENT_TIMESTAMP WHERE id=?",(content_hash,filename,doc_id))
+                ids=[r[0] for r in self.connection.execute("SELECT id FROM knowledge_chunks WHERE document_id=?",(doc_id,))]
+                for ident in ids: self.connection.execute("DELETE FROM knowledge_chunks_fts WHERE chunk_id=?",(str(ident),))
+                self.connection.execute("DELETE FROM knowledge_chunks WHERE document_id=?",(doc_id,))
+            else:
+                doc_id=self.connection.execute("INSERT INTO knowledge_documents(source_key,source_filename,title,content_hash,source_type) VALUES(?,?,?,?,?)",(source_key,filename,Path(filename).stem,content_hash,"local_text")).lastrowid
+            for index, chunk in enumerate(chunks):
+                h=__import__('hashlib').sha256(chunk.encode()).hexdigest()
+                cid=self.connection.execute("INSERT INTO knowledge_chunks(document_id,chunk_index,chunk_text,chunk_hash,character_count) VALUES(?,?,?,?,?)",(doc_id,index,chunk,h,len(chunk))).lastrowid
+                self.connection.execute("INSERT INTO knowledge_chunks_fts(chunk_id,chunk_text) VALUES(?,?)",(str(cid),chunk))
+            return doc_id
+
+    def search_knowledge(self, terms, limit):
+        rows=self.connection.execute("""SELECT c.id,c.document_id,d.source_filename,d.title,c.chunk_text,bm25(knowledge_chunks_fts) score FROM knowledge_chunks_fts f JOIN knowledge_chunks c ON c.id=CAST(f.chunk_id AS INTEGER) JOIN knowledge_documents d ON d.id=c.document_id WHERE knowledge_chunks_fts MATCH ? AND c.active=1 AND d.active=1 ORDER BY score,c.id LIMIT ?""",(terms,limit)).fetchall()
+        return [KnowledgeMatch(r["id"],r["document_id"],r["source_filename"],r["title"],r["chunk_text"],float(r["score"]),i+1) for i,r in enumerate(rows)]
+
+    def knowledge_index_fingerprint(self, version):
+        import hashlib
+        rows=self.connection.execute("SELECT source_key,content_hash FROM knowledge_documents WHERE active=1 ORDER BY source_key").fetchall()
+        return hashlib.sha256((version+"|"+"|".join(f"{r[0]}:{r[1]}" for r in rows)).encode()).hexdigest()
+
+    def successful_retrieval(self, conversation_id, fingerprint):
+        return self.connection.execute("SELECT id FROM knowledge_retrieval_runs WHERE conversation_id=? AND query_fingerprint=? AND status='succeeded'",(conversation_id,fingerprint)).fetchone()
+
+    def start_retrieval(self, conversation_id, analysis_id, query, fingerprint, index_fingerprint, retriever, version, limit):
+        with self.connection:
+            row=self.connection.execute("SELECT id FROM knowledge_retrieval_runs WHERE conversation_id=? AND query_fingerprint=?",(conversation_id,fingerprint)).fetchone()
+            if row:
+                self.connection.execute("UPDATE knowledge_retrieval_runs SET status='running',error_class=NULL,result_count=0,completed_at=NULL WHERE id=?",(row[0],)); return row[0]
+            return self.connection.execute("INSERT INTO knowledge_retrieval_runs(conversation_id,conversation_analysis_id,query_text,query_fingerprint,knowledge_index_fingerprint,retriever,retriever_version,retrieval_limit,status) VALUES(?,?,?,?,?,?,?,?, 'running')",(conversation_id,analysis_id,query,fingerprint,index_fingerprint,retriever,version,limit)).lastrowid
+
+    def complete_retrieval(self, run_id, matches):
+        with self.connection:
+            for match in matches: self.connection.execute("INSERT INTO knowledge_retrieval_results(retrieval_run_id,knowledge_chunk_id,rank,score) VALUES(?,?,?,?)",(run_id,match.chunk_id,match.rank,match.score))
+            self.connection.execute("UPDATE knowledge_retrieval_runs SET status='succeeded',result_count=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",(len(matches),run_id))
+
+    def fail_retrieval(self, run_id, error):
+        with self.connection: self.connection.execute("UPDATE knowledge_retrieval_runs SET status='failed',error_class=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",(error,run_id))
+
+    def latest_successful_conversation_analysis(self, conversation_id):
+        row=self.connection.execute("""SELECT a.*,r.id run_id FROM conversation_analyses a JOIN conversation_analysis_runs r ON r.id=a.conversation_analysis_run_id WHERE a.conversation_id=? AND r.status='succeeded' ORDER BY a.id DESC LIMIT 1""",(conversation_id,)).fetchone()
+        if not row: return None
+        return row['id'], ConversationAnalysis(row['conversation_summary'],row['current_intent'],row['priority'],row['urgency'],tuple(json.loads(row['unresolved_requests_json'])),tuple(json.loads(row['resolved_points_json'])),tuple(json.loads(row['order_numbers_json'])),tuple(json.loads(row['relevant_dates_json'])),row['latest_sender_request'],row['confidence'],bool(row['needs_human']),row['human_reason'],row['recommended_action'])
 
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)

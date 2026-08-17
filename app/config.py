@@ -33,6 +33,12 @@ class Settings:
     max_thread_messages: int = 10
     max_thread_context_chars: int = 24_000
     thread_context_builder_version: str = "v1"
+    knowledge_dir: Path = Path("knowledge")
+    knowledge_chunk_max_chars: int = 1200
+    knowledge_chunk_overlap_chars: int = 150
+    knowledge_retrieval_limit: int = 5
+    knowledge_retriever_version: str = "v1"
+    knowledge_index_version: str = "v1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -103,6 +109,9 @@ class Settings:
             max_thread_messages,
             max_thread_context_chars,
             os.environ.get("THREAD_CONTEXT_BUILDER_VERSION", "v1"),
+            Path(os.environ.get("KNOWLEDGE_DIR", "knowledge")),
+            int(os.environ.get("KNOWLEDGE_CHUNK_MAX_CHARS", "1200")), int(os.environ.get("KNOWLEDGE_CHUNK_OVERLAP_CHARS", "150")),
+            int(os.environ.get("KNOWLEDGE_RETRIEVAL_LIMIT", "5")), os.environ.get("KNOWLEDGE_RETRIEVER_VERSION", "v1"), os.environ.get("KNOWLEDGE_INDEX_VERSION", "v1"),
         )
 
     @property

@@ -140,4 +140,12 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_analysis_runs_message ON analysis_runs(message_id, status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_analysis_runs ON conversation_analysis_runs(conversation_id, status)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (id INTEGER PRIMARY KEY, source_key TEXT UNIQUE NOT NULL, source_filename TEXT NOT NULL, title TEXT, content_hash TEXT NOT NULL, source_type TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS knowledge_chunks (id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES knowledge_documents(id), chunk_index INTEGER NOT NULL, chunk_text TEXT NOT NULL, chunk_hash TEXT NOT NULL, character_count INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(document_id, chunk_index, chunk_hash))""")
+    connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(chunk_id UNINDEXED, chunk_text)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS knowledge_retrieval_runs (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id), conversation_analysis_id INTEGER, query_text TEXT NOT NULL, query_fingerprint TEXT NOT NULL, retriever TEXT NOT NULL, retriever_version TEXT NOT NULL, status TEXT NOT NULL, result_count INTEGER NOT NULL DEFAULT 0, error_class TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, UNIQUE(conversation_id,query_fingerprint))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS knowledge_retrieval_results (id INTEGER PRIMARY KEY, retrieval_run_id INTEGER NOT NULL REFERENCES knowledge_retrieval_runs(id), knowledge_chunk_id INTEGER NOT NULL REFERENCES knowledge_chunks(id), rank INTEGER NOT NULL, score REAL NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(retrieval_run_id,rank))""")
+    for statement in ("ALTER TABLE knowledge_retrieval_runs ADD COLUMN knowledge_index_fingerprint TEXT", "ALTER TABLE knowledge_retrieval_runs ADD COLUMN retrieval_limit INTEGER"):
+        try: connection.execute(statement)
+        except sqlite3.OperationalError: pass
     connection.commit()
