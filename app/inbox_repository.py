@@ -10,6 +10,7 @@ from pathlib import Path
 from .inbox_models import AuditEvent, Conversation, InboxMessage
 from .inbox_models import AnalysisRun
 from .analysis_models import InboxAnalysis
+from .conversation_models import ConversationAnalysis, ConversationAnalysisRun
 from .migrations import initialize_schema
 
 
@@ -36,6 +37,16 @@ class SqliteInboxRepository:
             (provider, provider_thread_id),
         ).fetchone()
         return _conversation_from_row(row) if row else None
+
+    def list_conversations(self) -> list[Conversation]:
+        rows = self.connection.execute("SELECT * FROM conversations ORDER BY id").fetchall()
+        return [_conversation_from_row(row) for row in rows]
+
+    def list_messages_for_conversation(self, conversation_id: int) -> list[InboxMessage]:
+        rows = self.connection.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY received_at ASC, id ASC", (conversation_id,),
+        ).fetchall()
+        return [_message_from_row(row) for row in rows]
 
     def get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         with self.connection:
@@ -122,6 +133,64 @@ class SqliteInboxRepository:
                 (error_class, run.id),
             )
 
+    def get_successful_conversation_analysis_run(self, conversation_id: int, context_fingerprint: str) -> ConversationAnalysisRun | None:
+        row = self.connection.execute(
+            """SELECT * FROM conversation_analysis_runs WHERE conversation_id = ? AND context_fingerprint = ?
+               AND status = 'succeeded'""", (conversation_id, context_fingerprint),
+        ).fetchone()
+        return _conversation_analysis_run_from_row(row) if row else None
+
+    def start_conversation_analysis_run(self, *, conversation_id: int, analyzer: str, analyzer_version: str,
+                                        model: str, prompt_version: str, context_fingerprint: str) -> ConversationAnalysisRun:
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT * FROM conversation_analysis_runs WHERE conversation_id = ? AND context_fingerprint = ?",
+                (conversation_id, context_fingerprint),
+            ).fetchone()
+            if row:
+                self.connection.execute(
+                    """UPDATE conversation_analysis_runs SET status = 'running', error_class = NULL,
+                       started_at = CURRENT_TIMESTAMP, completed_at = NULL WHERE id = ?""", (row["id"],),
+                )
+                return ConversationAnalysisRun(row["id"], conversation_id, analyzer, analyzer_version, model,
+                                               prompt_version, context_fingerprint, "running")
+            cursor = self.connection.execute(
+                """INSERT INTO conversation_analysis_runs (
+                    conversation_id, analyzer, analyzer_version, model, prompt_version, context_fingerprint, status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running')""",
+                (conversation_id, analyzer, analyzer_version, model, prompt_version, context_fingerprint),
+            )
+            return ConversationAnalysisRun(cursor.lastrowid, conversation_id, analyzer, analyzer_version, model,
+                                           prompt_version, context_fingerprint, "running")
+
+    def complete_conversation_analysis_run(self, run: ConversationAnalysisRun, latest_message_id: int,
+                                           context_truncated: bool, analysis: ConversationAnalysis) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO conversation_analyses (
+                    conversation_analysis_run_id, conversation_id, latest_message_id, conversation_summary,
+                    current_intent, priority, urgency, unresolved_requests_json, resolved_points_json,
+                    order_numbers_json, relevant_dates_json, latest_sender_request, confidence, needs_human,
+                    human_reason, recommended_action, context_truncated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run.id, run.conversation_id, latest_message_id, analysis.conversation_summary, analysis.current_intent,
+                 analysis.priority, analysis.urgency, json.dumps(list(analysis.unresolved_requests)),
+                 json.dumps(list(analysis.resolved_points)), json.dumps(list(analysis.order_numbers)),
+                 json.dumps(list(analysis.relevant_dates)), analysis.latest_sender_request, analysis.confidence,
+                 int(analysis.needs_human), analysis.human_reason, analysis.recommended_action, int(context_truncated)),
+            )
+            self.connection.execute(
+                """UPDATE conversation_analysis_runs SET status = 'succeeded', completed_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""", (run.id,),
+            )
+
+    def fail_conversation_analysis_run(self, run: ConversationAnalysisRun, error_class: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """UPDATE conversation_analysis_runs SET status = 'failed', error_class = ?,
+                   completed_at = CURRENT_TIMESTAMP WHERE id = ?""", (error_class, run.id),
+            )
+
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)
         if existing:
@@ -191,6 +260,12 @@ def _analysis_run_from_row(row: sqlite3.Row) -> AnalysisRun:
         row["id"], row["message_id"], row["analyzer"], row["model"], row["prompt_version"],
         row["input_fingerprint"], row["status"], row["error_class"],
     )
+
+
+def _conversation_analysis_run_from_row(row: sqlite3.Row) -> ConversationAnalysisRun:
+    return ConversationAnalysisRun(row["id"], row["conversation_id"], row["analyzer"], row["analyzer_version"],
+                                   row["model"], row["prompt_version"], row["context_fingerprint"],
+                                   row["status"], row["error_class"])
 
 
 def _safe_metadata(message: InboxMessage) -> Mapping[str, object]:

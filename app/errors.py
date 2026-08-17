@@ -58,6 +58,22 @@ class InboxAnalyzerResponseError(InboxAnalyzerError):
     pass
 
 
+class ConversationAnalyzerError(RuntimeError):
+    """Base error for recoverable conversation-analysis failures."""
+
+
+class ConversationAnalyzerAuthenticationError(ConversationAnalyzerError):
+    pass
+
+
+class ConversationAnalyzerAPIError(ConversationAnalyzerError):
+    pass
+
+
+class ConversationAnalyzerResponseError(ConversationAnalyzerError):
+    pass
+
+
 class GmailError(RuntimeError):
     """Base error for Gmail polling failures."""
 

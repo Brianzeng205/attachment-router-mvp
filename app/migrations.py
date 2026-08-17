@@ -95,7 +95,49 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             UNIQUE (analysis_run_id)
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS conversation_analysis_runs (
+            id INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+            analyzer TEXT NOT NULL,
+            analyzer_version TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            context_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_class TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (conversation_id, context_fingerprint)
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS conversation_analyses (
+            id INTEGER PRIMARY KEY,
+            conversation_analysis_run_id INTEGER NOT NULL REFERENCES conversation_analysis_runs(id),
+            conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+            latest_message_id INTEGER NOT NULL REFERENCES messages(id),
+            conversation_summary TEXT NOT NULL,
+            current_intent TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            urgency TEXT NOT NULL,
+            unresolved_requests_json TEXT NOT NULL,
+            resolved_points_json TEXT NOT NULL,
+            order_numbers_json TEXT NOT NULL,
+            relevant_dates_json TEXT NOT NULL,
+            latest_sender_request TEXT,
+            confidence REAL NOT NULL,
+            needs_human INTEGER NOT NULL,
+            human_reason TEXT,
+            recommended_action TEXT NOT NULL,
+            context_truncated INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (conversation_analysis_run_id)
+        )"""
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_analysis_runs_message ON analysis_runs(message_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_analysis_runs ON conversation_analysis_runs(conversation_id, status)")
     connection.commit()

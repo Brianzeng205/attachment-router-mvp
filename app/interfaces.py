@@ -6,6 +6,7 @@ from typing import Protocol
 from .models import Attachment, EmailMessage
 from .analysis_models import InboxAnalysis
 from .inbox_models import InboxMessage
+from .conversation_models import ConversationAnalysis, ConversationContext
 
 
 class EmailClient(Protocol):
@@ -35,3 +36,7 @@ class StateManager(Protocol):
 
 class InboxAnalyzer(Protocol):
     def analyze(self, message: InboxMessage) -> InboxAnalysis: ...
+
+
+class ConversationAnalyzer(Protocol):
+    def analyze(self, context: ConversationContext) -> ConversationAnalysis: ...

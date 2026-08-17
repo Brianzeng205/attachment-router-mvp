@@ -27,6 +27,12 @@ class Settings:
     inbox_analyzer_prompt_version: str = "v1"
     max_inbox_message_chars: int = 12_000
     inbox_analyzer_version: str = "v1"
+    conversation_analyzer_model: str = "claude-haiku-4-5"
+    conversation_analyzer_version: str = "v1"
+    conversation_analyzer_prompt_version: str = "v1"
+    max_thread_messages: int = 10
+    max_thread_context_chars: int = 24_000
+    thread_context_builder_version: str = "v1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -64,6 +70,15 @@ class Settings:
             raise ValueError("MAX_INBOX_MESSAGE_CHARS must be an integer") from exc
         if max_inbox_message_chars < 100 or max_inbox_message_chars > 100_000:
             raise ValueError("MAX_INBOX_MESSAGE_CHARS must be between 100 and 100000")
+        try:
+            max_thread_messages = int(os.environ.get("MAX_THREAD_MESSAGES", "10"))
+            max_thread_context_chars = int(os.environ.get("MAX_THREAD_CONTEXT_CHARS", "24000"))
+        except ValueError as exc:
+            raise ValueError("Thread context limits must be integers") from exc
+        if max_thread_messages < 1 or max_thread_messages > 100:
+            raise ValueError("MAX_THREAD_MESSAGES must be between 1 and 100")
+        if max_thread_context_chars < 100 or max_thread_context_chars > 200_000:
+            raise ValueError("MAX_THREAD_CONTEXT_CHARS must be between 100 and 200000")
         return cls(
             threshold,
             review_folder,
@@ -82,6 +97,12 @@ class Settings:
             os.environ.get("INBOX_ANALYZER_PROMPT_VERSION", "v1"),
             max_inbox_message_chars,
             os.environ.get("INBOX_ANALYZER_VERSION", "v1"),
+            os.environ.get("CONVERSATION_ANALYZER_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")),
+            os.environ.get("CONVERSATION_ANALYZER_VERSION", "v1"),
+            os.environ.get("CONVERSATION_ANALYZER_PROMPT_VERSION", "v1"),
+            max_thread_messages,
+            max_thread_context_chars,
+            os.environ.get("THREAD_CONTEXT_BUILDER_VERSION", "v1"),
         )
 
     @property

@@ -4,11 +4,14 @@ import logging
 from .config import Settings
 from .claude_classifier import ClaudeDocumentClassifier
 from .claude_inbox_analyzer import ClaudeInboxAnalyzer
+from .claude_conversation_analyzer import ClaudeConversationAnalyzer
 from .gmail_client import GmailClient
 from .google_drive import GoogleDriveClient
 from .inbox_repository import SqliteInboxRepository
 from .inbox_analysis_service import InboxAnalysisService
+from .conversation_analysis_service import ConversationAnalysisService
 from .message_ingestion import MessageIngestionService
+from .thread_context import ThreadContextBuilder
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
 
@@ -58,6 +61,22 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
             except Exception:
                 # Analysis is independent from the existing attachment-routing workflow.
                 logging.getLogger(__name__).exception("Inbox analysis path could not be initialised")
+            try:
+                conversation_analyzer = ClaudeConversationAnalyzer.from_settings(settings)
+                context_builder = ThreadContextBuilder(settings.max_thread_messages, settings.max_thread_context_chars,
+                                                       settings.thread_context_builder_version)
+                conversation_summary = ConversationAnalysisService(
+                    repository, context_builder, conversation_analyzer, analyzer_name="claude_conversation",
+                    analyzer_version=settings.conversation_analyzer_version, model=settings.conversation_analyzer_model,
+                    prompt_version=settings.conversation_analyzer_prompt_version,
+                ).analyze_all(repository.list_conversations())
+                if conversation_summary.errors:
+                    logging.getLogger(__name__).error(
+                        "Conversation analysis completed with errors analyzed=%s skipped=%s errors=%s",
+                        conversation_summary.analyzed, conversation_summary.skipped, conversation_summary.errors,
+                    )
+            except Exception:
+                logging.getLogger(__name__).exception("Conversation analysis path could not be initialised")
         finally:
             repository.close()
     except Exception:
