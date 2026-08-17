@@ -22,6 +22,7 @@ class EmailMessage:
     received_at: str
     attachments: tuple[Attachment, ...]
     thread_id: str | None = None
+    recipients: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

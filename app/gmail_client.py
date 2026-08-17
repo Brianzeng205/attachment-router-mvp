@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 from datetime import UTC, datetime
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -83,6 +84,7 @@ class GmailClient:
             received_at=received_at,
             attachments=attachments,
             thread_id=raw.get("threadId") if isinstance(raw.get("threadId"), str) else None,
+            recipients=_recipients(headers),
         )
 
     def _attachments(self, message_id: str, part: dict[str, Any], part_path: str) -> Iterable[Attachment]:
@@ -156,6 +158,12 @@ def _headers(headers: Any) -> dict[str, str]:
         if isinstance(header, dict) and isinstance(header.get("name"), str) and isinstance(header.get("value"), str):
             result[header["name"].lower()] = header["value"]
     return result
+
+
+def _recipients(headers: dict[str, str]) -> tuple[str, ...]:
+    """Keep parsed delivery facts without changing Gmail MIME processing."""
+    values = (headers.get("to", ""), headers.get("cc", ""))
+    return tuple(address.strip() for _, address in getaddresses(values) if address.strip())
 
 
 def _body_text(part: dict[str, Any]) -> str:

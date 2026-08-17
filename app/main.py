@@ -5,6 +5,8 @@ from .config import Settings
 from .claude_classifier import ClaudeDocumentClassifier
 from .gmail_client import GmailClient
 from .google_drive import GoogleDriveClient
+from .inbox_repository import SqliteInboxRepository
+from .message_ingestion import MessageIngestionService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
 
@@ -29,8 +31,24 @@ def build_email(settings: Settings | None = None) -> GmailClient:
 
 def run_once(settings: Settings | None = None) -> ProcessingSummary:
     settings = settings or Settings.from_env()
+    email = build_email(settings)
+    messages = tuple(email.list_messages())
+    try:
+        repository = SqliteInboxRepository(settings.state_db_path)
+        try:
+            ingestion_summary = MessageIngestionService(repository).ingest_all(messages)
+            if ingestion_summary.errors:
+                logging.getLogger(__name__).error(
+                    "Inbox ingestion completed with errors ingested=%s duplicates=%s errors=%s",
+                    ingestion_summary.ingested, ingestion_summary.duplicates, ingestion_summary.errors,
+                )
+        finally:
+            repository.close()
+    except Exception:
+        # The existing attachment router remains independently operable.
+        logging.getLogger(__name__).exception("Inbox persistence path could not be initialised")
     processor = AttachmentProcessor(
-        build_email(settings),
+        _StaticEmailClient(messages),
         build_classifier(settings),
         build_drive(settings),
         SqliteStateManager(settings.state_db_path),
@@ -42,6 +60,16 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
         summary.uploaded, summary.skipped, summary.errors,
     )
     return summary
+
+
+class _StaticEmailClient:
+    """Reuse the single Gmail retrieval for independent ingestion and routing paths."""
+
+    def __init__(self, messages: tuple) -> None:
+        self._messages = messages
+
+    def list_messages(self):
+        return self._messages
 
 
 if __name__ == "__main__":
