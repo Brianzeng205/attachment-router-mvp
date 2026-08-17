@@ -12,6 +12,7 @@ from .inbox_models import AnalysisRun
 from .analysis_models import InboxAnalysis
 from .conversation_models import ConversationAnalysis, ConversationAnalysisRun
 from .knowledge_models import KnowledgeMatch
+from .reply_draft_models import PersistedReplyDraft, ReplyDraft, ReplyDraftRun
 from .migrations import initialize_schema
 
 
@@ -241,6 +242,120 @@ class SqliteInboxRepository:
         if not row: return None
         return row['id'], ConversationAnalysis(row['conversation_summary'],row['current_intent'],row['priority'],row['urgency'],tuple(json.loads(row['unresolved_requests_json'])),tuple(json.loads(row['resolved_points_json'])),tuple(json.loads(row['order_numbers_json'])),tuple(json.loads(row['relevant_dates_json'])),row['latest_sender_request'],row['confidence'],bool(row['needs_human']),row['human_reason'],row['recommended_action'])
 
+    def get_successful_reply_draft_run(self, conversation_id: int, input_fingerprint: str) -> ReplyDraftRun | None:
+        row = self.connection.execute(
+            "SELECT * FROM reply_draft_runs WHERE conversation_id = ? AND input_fingerprint = ? AND status = 'succeeded'",
+            (conversation_id, input_fingerprint),
+        ).fetchone()
+        return _reply_draft_run_from_row(row) if row else None
+
+    def start_reply_draft_run(self, *, conversation_id: int, conversation_analysis_id: int,
+                              knowledge_retrieval_run_id: int, generator: str, generator_version: str,
+                              model: str, prompt_version: str, input_fingerprint: str) -> ReplyDraftRun:
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT * FROM reply_draft_runs WHERE conversation_id = ? AND input_fingerprint = ?",
+                (conversation_id, input_fingerprint),
+            ).fetchone()
+            if row:
+                self.connection.execute(
+                    """UPDATE reply_draft_runs SET status='running', error_class=NULL,
+                       started_at=CURRENT_TIMESTAMP, completed_at=NULL WHERE id=?""", (row["id"],),
+                )
+                return ReplyDraftRun(row["id"], conversation_id, conversation_analysis_id, knowledge_retrieval_run_id,
+                                     generator, generator_version, model, prompt_version, input_fingerprint, "running")
+            cursor = self.connection.execute(
+                """INSERT INTO reply_draft_runs (
+                    conversation_id, conversation_analysis_id, knowledge_retrieval_run_id, generator,
+                    generator_version, model, prompt_version, input_fingerprint, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')""",
+                (conversation_id, conversation_analysis_id, knowledge_retrieval_run_id, generator, generator_version,
+                 model, prompt_version, input_fingerprint),
+            )
+            return ReplyDraftRun(cursor.lastrowid, conversation_id, conversation_analysis_id, knowledge_retrieval_run_id,
+                                 generator, generator_version, model, prompt_version, input_fingerprint, "running")
+
+    def complete_reply_draft_run(self, run: ReplyDraftRun, *, latest_message_id: int,
+                                 draft: ReplyDraft, grounding_chunk_ids: tuple[int, ...]) -> PersistedReplyDraft:
+        """Persist the local draft, provenance, and success state atomically."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """INSERT INTO reply_drafts (
+                    draft_run_id, conversation_id, latest_message_id, draft_status, subject, body, confidence,
+                    needs_review, review_reason, unsupported_claims_json, response_language
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run.id, run.conversation_id, latest_message_id, draft.draft_status, draft.subject, draft.body,
+                 draft.confidence, int(draft.needs_review), draft.review_reason,
+                 json.dumps(list(draft.unsupported_claims), ensure_ascii=False), draft.response_language),
+            )
+            draft_id = cursor.lastrowid
+            for chunk_id in grounding_chunk_ids:
+                self.connection.execute(
+                    "INSERT INTO reply_draft_grounding (reply_draft_id, knowledge_chunk_id) VALUES (?, ?)",
+                    (draft_id, chunk_id),
+                )
+            self.connection.execute(
+                "UPDATE reply_draft_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP WHERE id=?", (run.id,),
+            )
+            return PersistedReplyDraft(draft_id, run.id, run.conversation_id, latest_message_id, draft)
+
+    def fail_reply_draft_run(self, run: ReplyDraftRun, error_class: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE reply_draft_runs SET status='failed', error_class=?, completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                (error_class, run.id),
+            )
+
+    def get_reply_draft_by_run_id(self, run_id: int) -> PersistedReplyDraft | None:
+        row = self.connection.execute("SELECT * FROM reply_drafts WHERE draft_run_id=?", (run_id,)).fetchone()
+        return _persisted_reply_draft_from_row(row) if row else None
+
+    def get_reply_draft_grounding(self, reply_draft_id: int) -> tuple[int, ...]:
+        rows = self.connection.execute(
+            "SELECT knowledge_chunk_id FROM reply_draft_grounding WHERE reply_draft_id=? ORDER BY knowledge_chunk_id",
+            (reply_draft_id,),
+        ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def successful_retrieval_snapshot(self, retrieval_run_id: int) -> tuple[int, int, str | None, tuple[tuple[int, str], ...]] | None:
+        """Return only stable provenance facts for a successful retrieval run."""
+        row = self.connection.execute(
+            """SELECT conversation_id, conversation_analysis_id, knowledge_index_fingerprint
+               FROM knowledge_retrieval_runs WHERE id=? AND status='succeeded'""", (retrieval_run_id,),
+        ).fetchone()
+        if not row:
+            return None
+        chunks = self.connection.execute(
+            """SELECT result.knowledge_chunk_id, chunk.chunk_hash FROM knowledge_retrieval_results result
+               JOIN knowledge_chunks chunk ON chunk.id=result.knowledge_chunk_id
+               WHERE result.retrieval_run_id=? ORDER BY result.rank, result.knowledge_chunk_id""", (retrieval_run_id,),
+        ).fetchall()
+        return row["conversation_id"], row["conversation_analysis_id"], row["knowledge_index_fingerprint"], tuple(
+            (chunk["knowledge_chunk_id"], chunk["chunk_hash"]) for chunk in chunks
+        )
+
+    def latest_successful_retrieval(self, conversation_id: int, analysis_id: int) -> tuple[int, list[KnowledgeMatch]] | None:
+        row = self.connection.execute(
+            """SELECT id FROM knowledge_retrieval_runs
+               WHERE conversation_id=? AND conversation_analysis_id=? AND status='succeeded'
+               ORDER BY id DESC LIMIT 1""", (conversation_id, analysis_id),
+        ).fetchone()
+        if not row:
+            return None
+        rows = self.connection.execute(
+            """SELECT result.knowledge_chunk_id, chunk.document_id, document.source_filename, document.title,
+                      chunk.chunk_text, result.score, result.rank
+               FROM knowledge_retrieval_results result
+               JOIN knowledge_chunks chunk ON chunk.id=result.knowledge_chunk_id
+               JOIN knowledge_documents document ON document.id=chunk.document_id
+               WHERE result.retrieval_run_id=? ORDER BY result.rank, result.knowledge_chunk_id""", (row["id"],),
+        ).fetchall()
+        return row["id"], [
+            KnowledgeMatch(item["knowledge_chunk_id"], item["document_id"], item["source_filename"], item["title"],
+                           item["chunk_text"], float(item["score"]), item["rank"])
+            for item in rows
+        ]
+
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)
         if existing:
@@ -316,6 +431,22 @@ def _conversation_analysis_run_from_row(row: sqlite3.Row) -> ConversationAnalysi
     return ConversationAnalysisRun(row["id"], row["conversation_id"], row["analyzer"], row["analyzer_version"],
                                    row["model"], row["prompt_version"], row["context_fingerprint"],
                                    row["status"], row["error_class"])
+
+
+def _reply_draft_run_from_row(row: sqlite3.Row) -> ReplyDraftRun:
+    return ReplyDraftRun(
+        row["id"], row["conversation_id"], row["conversation_analysis_id"], row["knowledge_retrieval_run_id"],
+        row["generator"], row["generator_version"], row["model"], row["prompt_version"],
+        row["input_fingerprint"], row["status"], row["error_class"],
+    )
+
+
+def _persisted_reply_draft_from_row(row: sqlite3.Row) -> PersistedReplyDraft:
+    draft = ReplyDraft(
+        row["draft_status"], row["subject"], row["body"], (), tuple(json.loads(row["unsupported_claims_json"])),
+        float(row["confidence"]), bool(row["needs_review"]), row["review_reason"], row["response_language"],
+    )
+    return PersistedReplyDraft(row["id"], row["draft_run_id"], row["conversation_id"], row["latest_message_id"], draft)
 
 
 def _safe_metadata(message: InboxMessage) -> Mapping[str, object]:

@@ -39,6 +39,9 @@ class Settings:
     knowledge_retrieval_limit: int = 5
     knowledge_retriever_version: str = "v1"
     knowledge_index_version: str = "v1"
+    reply_draft_generator_model: str = "claude-haiku-4-5"
+    reply_draft_generator_version: str = "v1"
+    reply_draft_prompt_version: str = "v1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -112,6 +115,8 @@ class Settings:
             Path(os.environ.get("KNOWLEDGE_DIR", "knowledge")),
             int(os.environ.get("KNOWLEDGE_CHUNK_MAX_CHARS", "1200")), int(os.environ.get("KNOWLEDGE_CHUNK_OVERLAP_CHARS", "150")),
             int(os.environ.get("KNOWLEDGE_RETRIEVAL_LIMIT", "5")), os.environ.get("KNOWLEDGE_RETRIEVER_VERSION", "v1"), os.environ.get("KNOWLEDGE_INDEX_VERSION", "v1"),
+            os.environ.get("REPLY_DRAFT_GENERATOR_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")),
+            os.environ.get("REPLY_DRAFT_GENERATOR_VERSION", "v1"), os.environ.get("REPLY_DRAFT_PROMPT_VERSION", "v1"),
         )
 
     @property

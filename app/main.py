@@ -14,6 +14,9 @@ from .message_ingestion import MessageIngestionService
 from .thread_context import ThreadContextBuilder
 from .knowledge import KnowledgeIngestionService, SqliteKnowledgeRetriever
 from .knowledge_retrieval_service import KnowledgeRetrievalService
+from .claude_reply_draft_generator import ClaudeGroundedReplyGenerator
+from .reply_draft_input import ReplyDraftInput
+from .reply_draft_service import ReplyDraftService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
 
@@ -45,12 +48,18 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
         try:
             ingestion = MessageIngestionService(repository)
             inbox = InboxAnalysisService(repository, ClaudeInboxAnalyzer.from_settings(settings), analyzer_name=f"claude_inbox:{settings.inbox_analyzer_version}", model=settings.inbox_analyzer_model, prompt_version=settings.inbox_analyzer_prompt_version)
-            conversation = ConversationAnalysisService(repository, ThreadContextBuilder(settings.max_thread_messages, settings.max_thread_context_chars, settings.thread_context_builder_version), ClaudeConversationAnalyzer.from_settings(settings), analyzer_name="claude_conversation", analyzer_version=settings.conversation_analyzer_version, model=settings.conversation_analyzer_model, prompt_version=settings.conversation_analyzer_prompt_version)
+            context_builder = ThreadContextBuilder(settings.max_thread_messages, settings.max_thread_context_chars, settings.thread_context_builder_version)
+            conversation = ConversationAnalysisService(repository, context_builder, ClaudeConversationAnalyzer.from_settings(settings), analyzer_name="claude_conversation", analyzer_version=settings.conversation_analyzer_version, model=settings.conversation_analyzer_model, prompt_version=settings.conversation_analyzer_prompt_version)
             try: KnowledgeIngestionService(repository, settings.knowledge_dir, settings.knowledge_chunk_max_chars, settings.knowledge_chunk_overlap_chars, settings.knowledge_index_version).ingest_all()
             except FileNotFoundError: logging.getLogger(__name__).info("Knowledge directory is unavailable; retrieval skipped")
             retrieval = KnowledgeRetrievalService(repository, SqliteKnowledgeRetriever(repository), limit=settings.knowledge_retrieval_limit, retriever_version=settings.knowledge_retriever_version, index_version=settings.knowledge_index_version)
+            drafting = ReplyDraftService(
+                repository, ClaudeGroundedReplyGenerator.from_settings(settings), generator_name="claude_grounded_reply",
+                generator_version=settings.reply_draft_generator_version, model=settings.reply_draft_generator_model,
+                prompt_version=settings.reply_draft_prompt_version,
+            )
             processor = AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings)
-            return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, attachment_processor=processor)
+            return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, reply_draft_service=drafting, thread_context_builder=context_builder, attachment_processor=processor)
         finally:
             repository.close()
     except Exception:
@@ -60,8 +69,9 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
 
 
 def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox_analysis_service,
-                       conversation_analysis_service, knowledge_retrieval_service, attachment_processor):
-    """Injectable Phase-4 execution seam; services own analysis/retrieval policy."""
+                       conversation_analysis_service, knowledge_retrieval_service, attachment_processor,
+                       reply_draft_service=None, thread_context_builder=None):
+    """Injectable Phase-5 execution seam; services own analysis, retrieval, and draft idempotency."""
     try:
         message_ingestion_service.ingest_all(messages)
         inbox_analysis_service.analyze_all(messages)
@@ -71,6 +81,21 @@ def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox
             if persisted:
                 analysis_id, analysis = persisted
                 knowledge_retrieval_service.retrieve(conversation.id, analysis_id, analysis)
+                if reply_draft_service and thread_context_builder:
+                    retrieval = repository.latest_successful_retrieval(conversation.id, analysis_id)
+                    if not retrieval:
+                        continue
+                    retrieval_run_id, matches = retrieval
+                    context = thread_context_builder.build(
+                        conversation, repository.list_messages_for_conversation(conversation.id),
+                    )
+                    try:
+                        reply_draft_service.create_draft(
+                            ReplyDraftInput.from_context(context, analysis, retrieval_run_id, matches),
+                            conversation_analysis_id=analysis_id,
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception("Reply drafting failed conversation_id=%s", conversation.id)
     except Exception:
         logging.getLogger(__name__).exception("Inbox agent branch failed")
     return attachment_processor.process_all()

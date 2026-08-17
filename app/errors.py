@@ -74,6 +74,22 @@ class ConversationAnalyzerResponseError(ConversationAnalyzerError):
     pass
 
 
+class ReplyDraftGeneratorError(RuntimeError):
+    """Base error for recoverable grounded reply-drafting failures."""
+
+
+class ReplyDraftGeneratorAuthenticationError(ReplyDraftGeneratorError):
+    pass
+
+
+class ReplyDraftGeneratorAPIError(ReplyDraftGeneratorError):
+    pass
+
+
+class ReplyDraftGeneratorResponseError(ReplyDraftGeneratorError):
+    pass
+
+
 class GmailError(RuntimeError):
     """Base error for Gmail polling failures."""
 

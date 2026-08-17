@@ -148,4 +148,29 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     for statement in ("ALTER TABLE knowledge_retrieval_runs ADD COLUMN knowledge_index_fingerprint TEXT", "ALTER TABLE knowledge_retrieval_runs ADD COLUMN retrieval_limit INTEGER"):
         try: connection.execute(statement)
         except sqlite3.OperationalError: pass
+    connection.execute("""CREATE TABLE IF NOT EXISTS reply_draft_runs (
+        id INTEGER PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        conversation_analysis_id INTEGER NOT NULL REFERENCES conversation_analyses(id),
+        knowledge_retrieval_run_id INTEGER NOT NULL REFERENCES knowledge_retrieval_runs(id),
+        generator TEXT NOT NULL, generator_version TEXT NOT NULL, model TEXT NOT NULL, prompt_version TEXT NOT NULL,
+        input_fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+        error_class TEXT, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(conversation_id, input_fingerprint)
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS reply_drafts (
+        id INTEGER PRIMARY KEY, draft_run_id INTEGER NOT NULL UNIQUE REFERENCES reply_draft_runs(id),
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id), latest_message_id INTEGER NOT NULL REFERENCES messages(id),
+        draft_status TEXT NOT NULL, subject TEXT, body TEXT NOT NULL, confidence REAL NOT NULL,
+        needs_review INTEGER NOT NULL, review_reason TEXT, unsupported_claims_json TEXT NOT NULL,
+        response_language TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS reply_draft_grounding (
+        reply_draft_id INTEGER NOT NULL REFERENCES reply_drafts(id),
+        knowledge_chunk_id INTEGER NOT NULL REFERENCES knowledge_chunks(id),
+        PRIMARY KEY(reply_draft_id, knowledge_chunk_id)
+    )""")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_reply_draft_runs_conversation ON reply_draft_runs(conversation_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_reply_draft_grounding_chunk ON reply_draft_grounding(knowledge_chunk_id)")
     connection.commit()
