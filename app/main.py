@@ -3,9 +3,11 @@ import logging
 
 from .config import Settings
 from .claude_classifier import ClaudeDocumentClassifier
+from .claude_inbox_analyzer import ClaudeInboxAnalyzer
 from .gmail_client import GmailClient
 from .google_drive import GoogleDriveClient
 from .inbox_repository import SqliteInboxRepository
+from .inbox_analysis_service import InboxAnalysisService
 from .message_ingestion import MessageIngestionService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
@@ -42,6 +44,20 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
                     "Inbox ingestion completed with errors ingested=%s duplicates=%s errors=%s",
                     ingestion_summary.ingested, ingestion_summary.duplicates, ingestion_summary.errors,
                 )
+            try:
+                analyzer = ClaudeInboxAnalyzer.from_settings(settings)
+                analysis_summary = InboxAnalysisService(
+                    repository, analyzer, analyzer_name=f"claude_inbox:{settings.inbox_analyzer_version}", model=settings.inbox_analyzer_model,
+                    prompt_version=settings.inbox_analyzer_prompt_version,
+                ).analyze_all(messages)
+                if analysis_summary.errors:
+                    logging.getLogger(__name__).error(
+                        "Inbox analysis completed with errors analyzed=%s skipped=%s errors=%s",
+                        analysis_summary.analyzed, analysis_summary.skipped, analysis_summary.errors,
+                    )
+            except Exception:
+                # Analysis is independent from the existing attachment-routing workflow.
+                logging.getLogger(__name__).exception("Inbox analysis path could not be initialised")
         finally:
             repository.close()
     except Exception:

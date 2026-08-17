@@ -23,6 +23,10 @@ class Settings:
     gmail_oauth_token_file: Path = Path("secrets/google-gmail-token.json")
     gmail_search_query: str = "has:attachment"
     max_attachment_bytes: int = 10 * 1024 * 1024
+    inbox_analyzer_model: str = "claude-haiku-4-5"
+    inbox_analyzer_prompt_version: str = "v1"
+    max_inbox_message_chars: int = 12_000
+    inbox_analyzer_version: str = "v1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,6 +58,12 @@ class Settings:
             raise ValueError("MAX_ATTACHMENT_BYTES must be an integer") from exc
         if max_attachment_bytes < 1 or max_attachment_bytes > 100 * 1024 * 1024:
             raise ValueError("MAX_ATTACHMENT_BYTES must be between 1 and 104857600")
+        try:
+            max_inbox_message_chars = int(os.environ.get("MAX_INBOX_MESSAGE_CHARS", "12000"))
+        except ValueError as exc:
+            raise ValueError("MAX_INBOX_MESSAGE_CHARS must be an integer") from exc
+        if max_inbox_message_chars < 100 or max_inbox_message_chars > 100_000:
+            raise ValueError("MAX_INBOX_MESSAGE_CHARS must be between 100 and 100000")
         return cls(
             threshold,
             review_folder,
@@ -68,6 +78,10 @@ class Settings:
             Path(os.environ.get("GMAIL_OAUTH_TOKEN_FILE", "secrets/google-gmail-token.json")),
             os.environ.get("GMAIL_SEARCH_QUERY", "has:attachment"),
             max_attachment_bytes,
+            os.environ.get("INBOX_ANALYZER_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")),
+            os.environ.get("INBOX_ANALYZER_PROMPT_VERSION", "v1"),
+            max_inbox_message_chars,
+            os.environ.get("INBOX_ANALYZER_VERSION", "v1"),
         )
 
     @property

@@ -4,6 +4,8 @@ from collections.abc import Iterable, Mapping
 from typing import Protocol
 
 from .models import Attachment, EmailMessage
+from .analysis_models import InboxAnalysis
+from .inbox_models import InboxMessage
 
 
 class EmailClient(Protocol):
@@ -29,3 +31,7 @@ class StateManager(Protocol):
     def is_processed(self, email_id: str, attachment_id: str) -> bool: ...
 
     def mark_processed(self, email_id: str, attachment_id: str) -> None: ...
+
+
+class InboxAnalyzer(Protocol):
+    def analyze(self, message: InboxMessage) -> InboxAnalysis: ...

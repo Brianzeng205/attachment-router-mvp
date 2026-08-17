@@ -57,6 +57,45 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS analysis_runs (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL REFERENCES messages(id),
+            analyzer TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_class TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (message_id, input_fingerprint)
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS message_analyses (
+            id INTEGER PRIMARY KEY,
+            analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id),
+            message_id INTEGER NOT NULL REFERENCES messages(id),
+            category TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            urgency TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            customer_name TEXT,
+            order_numbers_json TEXT NOT NULL,
+            dates_json TEXT NOT NULL,
+            requirements_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            needs_human INTEGER NOT NULL,
+            human_reason TEXT,
+            recommended_action TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (analysis_run_id)
+        )"""
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_analysis_runs_message ON analysis_runs(message_id, status)")
     connection.commit()

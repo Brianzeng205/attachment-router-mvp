@@ -40,3 +40,15 @@ class AuditEvent:
     correlation_id: str | None = None
     metadata: Mapping[str, object] | None = None
     id: int | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisRun:
+    id: int
+    message_id: int
+    analyzer: str
+    model: str
+    prompt_version: str
+    input_fingerprint: str
+    status: str
+    error_class: str | None = None

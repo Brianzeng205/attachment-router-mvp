@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .inbox_models import AuditEvent, Conversation, InboxMessage
+from .inbox_models import AnalysisRun
+from .analysis_models import InboxAnalysis
 from .migrations import initialize_schema
 
 
@@ -65,6 +67,60 @@ class SqliteInboxRepository:
                     metadata={"provider": message.provider, "provider_thread_id": message.provider_thread_id},
                 ))
             return stored, conversation, message_created, conversation_created
+
+    def get_successful_analysis_run(self, message_id: int, input_fingerprint: str) -> AnalysisRun | None:
+        row = self.connection.execute(
+            "SELECT * FROM analysis_runs WHERE message_id = ? AND input_fingerprint = ? AND status = 'succeeded'",
+            (message_id, input_fingerprint),
+        ).fetchone()
+        return _analysis_run_from_row(row) if row else None
+
+    def start_analysis_run(self, *, message_id: int, analyzer: str, model: str, prompt_version: str,
+                           input_fingerprint: str) -> AnalysisRun:
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT * FROM analysis_runs WHERE message_id = ? AND input_fingerprint = ?",
+                (message_id, input_fingerprint),
+            ).fetchone()
+            if row:
+                self.connection.execute(
+                    """UPDATE analysis_runs SET status = 'running', error_class = NULL,
+                       started_at = CURRENT_TIMESTAMP, completed_at = NULL WHERE id = ?""",
+                    (row["id"],),
+                )
+                return AnalysisRun(row["id"], message_id, analyzer, model, prompt_version, input_fingerprint, "running")
+            cursor = self.connection.execute(
+                """INSERT INTO analysis_runs (message_id, analyzer, model, prompt_version, input_fingerprint, status)
+                   VALUES (?, ?, ?, ?, ?, 'running')""",
+                (message_id, analyzer, model, prompt_version, input_fingerprint),
+            )
+            return AnalysisRun(cursor.lastrowid, message_id, analyzer, model, prompt_version, input_fingerprint, "running")
+
+    def complete_analysis_run(self, run: AnalysisRun, analysis: InboxAnalysis) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO message_analyses (
+                    analysis_run_id, message_id, category, intent, priority, urgency, summary, customer_name,
+                    order_numbers_json, dates_json, requirements_json, confidence, needs_human, human_reason,
+                    recommended_action
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run.id, run.message_id, analysis.category, analysis.intent, analysis.priority, analysis.urgency,
+                 analysis.summary, analysis.customer_name, json.dumps(list(analysis.order_numbers)),
+                 json.dumps(list(analysis.dates)), json.dumps(list(analysis.requirements)), analysis.confidence,
+                 int(analysis.needs_human), analysis.human_reason, analysis.recommended_action),
+            )
+            self.connection.execute(
+                "UPDATE analysis_runs SET status = 'succeeded', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (run.id,),
+            )
+
+    def fail_analysis_run(self, run: AnalysisRun, error_class: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """UPDATE analysis_runs SET status = 'failed', error_class = ?, completed_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (error_class, run.id),
+            )
 
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)
@@ -128,6 +184,13 @@ def _message_from_row(row: sqlite3.Row) -> InboxMessage:
 
 def _conversation_from_row(row: sqlite3.Row) -> Conversation:
     return Conversation(row["id"], row["provider"], row["provider_thread_id"], row["status"], row["latest_message_at"])
+
+
+def _analysis_run_from_row(row: sqlite3.Row) -> AnalysisRun:
+    return AnalysisRun(
+        row["id"], row["message_id"], row["analyzer"], row["model"], row["prompt_version"],
+        row["input_fingerprint"], row["status"], row["error_class"],
+    )
 
 
 def _safe_metadata(message: InboxMessage) -> Mapping[str, object]:

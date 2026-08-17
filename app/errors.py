@@ -42,6 +42,22 @@ class ClassifierResponseError(ClassifierError):
     pass
 
 
+class InboxAnalyzerError(RuntimeError):
+    """Base error for recoverable inbox-analysis failures."""
+
+
+class InboxAnalyzerAuthenticationError(InboxAnalyzerError):
+    pass
+
+
+class InboxAnalyzerAPIError(InboxAnalyzerError):
+    pass
+
+
+class InboxAnalyzerResponseError(InboxAnalyzerError):
+    pass
+
+
 class GmailError(RuntimeError):
     """Base error for Gmail polling failures."""
 
