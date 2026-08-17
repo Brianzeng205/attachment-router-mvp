@@ -9,6 +9,9 @@ from app.models import Attachment, EmailMessage
 from app.conversation_models import ContextMessage, ConversationAnalysis, ConversationContext
 from app.inbox_models import Conversation
 from app.knowledge_models import KnowledgeMatch
+from app.decision_policy import DefaultDecisionPolicy
+from app.policy_models import PolicyDecision
+from app.reply_draft_models import PersistedReplyDraft, ReplyDraft
 
 class S:
  def __init__(self, fail=False): self.calls=0; self.fail=fail
@@ -38,6 +41,7 @@ class DraftRepo(Repo):
  def latest_successful_conversation_analysis(self,id): return (7,self.analysis_value) if self.analysis else None
  def latest_successful_retrieval(self,conversation_id,analysis_id): return (19,self.matches)
  def list_messages_for_conversation(self,conversation_id): return []
+ def get_reply_draft_run_fingerprint(self,run_id): return 'draft-fingerprint'
 
 class Builder:
  def __init__(self):
@@ -47,16 +51,39 @@ class Builder:
  def build(self,conversation,messages): self.calls.append((conversation,messages)); return self.context
 
 class Drafting:
- def __init__(self, fail=False): self.calls=[]; self.fail=fail
+ def __init__(self, fail=False, reply=None):
+  self.calls=[]; self.fail=fail; self.reply=reply or ReplyDraft('drafted','Re: Help','Validated local reply',(11,),(),.9,False,None,'en')
  def create_draft(self,draft_input,*,conversation_analysis_id):
   self.calls.append((draft_input,conversation_analysis_id))
   if self.fail: raise RuntimeError('draft failed')
-  return type('Outcome',(),{'generated':True})()
+  return type('Outcome',(),{'generated':True,'draft':PersistedReplyDraft(31,41,1,3,self.reply)})()
+
+class Policy:
+ def __init__(self, fail=False): self.calls=[]; self.fail=fail; self.actual=DefaultDecisionPolicy()
+ def evaluate(self,**kwargs):
+  self.calls.append(kwargs)
+  if self.fail: raise RuntimeError('policy failed')
+  return self.actual.evaluate(**kwargs)
+
+class Review:
+ def __init__(self, fail=False): self.calls=[]; self.fail=fail; self.rows={}; self.transition_calls=[]
+ def record_decision(self,**kwargs):
+  self.calls.append(kwargs)
+  if self.fail: raise RuntimeError('review persistence failed')
+  decision=kwargs['decision']; review_type={'ready_for_review':'standard_review','human_review_required':'required_review','blocked':'blocked_resolution'}.get(decision.decision)
+  key=(kwargs['reply_draft_id'],decision.rule_version,decision.decision)
+  if key not in self.rows:
+   item=None if review_type is None else type('Item',(),{'review_type':review_type,'status':'pending'})()
+   self.rows[key]=type('Result',(),{'policy_decision':decision,'review_item':item})()
+  return self.rows[key]
+ def approve(self,*args): self.transition_calls.append(('approve',args))
+ def reject(self,*args): self.transition_calls.append(('reject',args))
+ def request_changes(self,*args): self.transition_calls.append(('request_changes',args))
 
 class RuntimeTests(unittest.TestCase):
- def execute_cycle(self, repo=None, convo=None, retrieval=None, drafting=None, builder=None):
+ def execute_cycle(self, repo=None, convo=None, retrieval=None, drafting=None, builder=None, policy=None, review=None):
   msg=EmailMessage('m','s','x','b','t',(Attachment('a','a.txt',b'x'),),'t')
-  attach=S(); result=process_poll_cycle(messages=[msg],repository=repo or Repo(),message_ingestion_service=S(),inbox_analysis_service=S(),conversation_analysis_service=convo or S(),knowledge_retrieval_service=retrieval or Retrieval(),reply_draft_service=drafting,thread_context_builder=builder,attachment_processor=attach); return result,attach
+  attach=S(); result=process_poll_cycle(messages=[msg],repository=repo or Repo(),message_ingestion_service=S(),inbox_analysis_service=S(),conversation_analysis_service=convo or S(),knowledge_retrieval_service=retrieval or Retrieval(),reply_draft_service=drafting,thread_context_builder=builder,decision_policy=policy,review_queue_service=review,attachment_processor=attach); return result,attach
  def test_success_analysis_triggers_retrieval_and_stops(self):
   r=Retrieval(); result,attach=self.execute_cycle(retrieval=r); self.assertEqual(r.calls,[(1,7,'validated-analysis')]); self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1)
  def test_missing_analysis_blocks_retrieval(self):
@@ -83,6 +110,44 @@ class RuntimeTests(unittest.TestCase):
   retrieval=Retrieval(); draft=Drafting(True); repo=DraftRepo(matches=[KnowledgeMatch(11,2,'policy.md',None,'approved knowledge',.8,1)])
   _,attach=self.execute_cycle(repo=repo,retrieval=retrieval,drafting=draft,builder=Builder())
   self.assertEqual(len(retrieval.calls),1); self.assertEqual(len(draft.calls),1); self.assertEqual(attach.calls,1)
+ def test_policy_decision_flows_create_only_expected_pending_local_review_state(self):
+  cases=(
+   (ReplyDraft('drafted','Re','Safe reply',(11,),(),.9,False,None,'en'),'ready_for_review','standard_review'),
+   (ReplyDraft('insufficient_knowledge',None,'Insufficient confirmed information',(),(),1,True,'insufficient_knowledge','en'),'human_review_required','required_review'),
+   (ReplyDraft('drafted','Re','Unsafe reply',(11,),('unsupported claim',),.9,False,None,'en'),'blocked','blocked_resolution'),
+   (ReplyDraft('not_applicable',None,'No reply is applicable',(),(),.9,False,None,'en'),'no_action',None),
+  )
+  for reply,expected,review_type in cases:
+   with self.subTest(decision=expected):
+    repo=DraftRepo(matches=[KnowledgeMatch(11,2,'policy.md',None,'approved knowledge',.8,1)]); drafting=Drafting(reply=reply); policy=Policy(); review=Review()
+    result,attach=self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
+    self.assertEqual(result,'attachment-summary'); self.assertEqual(attach.calls,1); self.assertEqual(len(policy.calls),1); self.assertEqual(len(review.calls),1)
+    self.assertIs(policy.calls[0]['conversation_analysis'],repo.analysis_value); self.assertIs(policy.calls[0]['reply_draft'],reply)
+    self.assertEqual(review.calls[0]['decision'].decision,expected)
+    outcome=next(iter(review.rows.values())); self.assertEqual(outcome.review_item.review_type if outcome.review_item else None,review_type)
+    if outcome.review_item: self.assertEqual(outcome.review_item.status,'pending')
+    self.assertEqual(review.transition_calls,[])
+ def test_ai_draft_reply_recommendation_cannot_override_human_review_policy(self):
+  repo=DraftRepo(matches=[]); reply=ReplyDraft('insufficient_knowledge',None,'Need confirmed information',(),(),1,True,'insufficient_knowledge','en'); policy=Policy(); review=Review()
+  self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=Drafting(reply=reply),builder=Builder(),policy=policy,review=review)
+  self.assertEqual(repo.analysis_value.recommended_action,'draft_reply'); self.assertEqual(review.calls[0]['decision'].decision,'human_review_required')
+ def test_upstream_failures_never_reach_policy_or_review(self):
+  cases=((S(True),Retrieval(),Drafting()),(S(),Retrieval(True),Drafting()),(S(),Retrieval(),Drafting(True)))
+  for convo,retrieval,drafting in cases:
+   with self.subTest(failure=(convo.fail,retrieval.fail,drafting.fail)):
+    policy=Policy(); review=Review(); self.execute_cycle(repo=DraftRepo(matches=[]),convo=convo,retrieval=retrieval,drafting=drafting,builder=Builder(),policy=policy,review=review)
+    self.assertEqual(policy.calls,[]); self.assertEqual(review.calls,[])
+ def test_policy_or_review_failure_preserves_local_draft_and_attachment_independence(self):
+  for policy,review in ((Policy(True),Review()),(Policy(),Review(True))):
+   with self.subTest(policy_failure=policy.fail,review_failure=review.fail):
+    drafting=Drafting(); _,attach=self.execute_cycle(repo=DraftRepo(matches=[]),retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
+    self.assertEqual(len(drafting.calls),1); self.assertEqual(attach.calls,1)
+    self.assertEqual(len(policy.calls),1)
+    self.assertEqual(len(review.calls),0 if policy.fail else 1)
+ def test_repeated_runtime_relies_on_review_service_idempotency_and_never_auto_resolves(self):
+  repo=DraftRepo(matches=[]); drafting=Drafting(); policy=Policy(); review=Review()
+  for _ in range(2): self.execute_cycle(repo=repo,retrieval=Retrieval(),drafting=drafting,builder=Builder(),policy=policy,review=review)
+  self.assertEqual(len(review.calls),2); self.assertEqual(len(review.rows),1); self.assertEqual(next(iter(review.rows.values())).review_item.status,'pending'); self.assertEqual(review.transition_calls,[])
  def test_run_once_delegates_to_process_poll_cycle(self):
   with tempfile.TemporaryDirectory() as directory:
    settings=Settings(.85,'review',{'x':'folder'},Path(directory)/'state.sqlite3',anthropic_api_key='test')

@@ -13,6 +13,8 @@ from .analysis_models import InboxAnalysis
 from .conversation_models import ConversationAnalysis, ConversationAnalysisRun
 from .knowledge_models import KnowledgeMatch
 from .reply_draft_models import PersistedReplyDraft, ReplyDraft, ReplyDraftRun
+from .policy_models import PolicyDecision
+from .review_models import HumanReviewEvent, HumanReviewItem, PersistedPolicyDecision
 from .migrations import initialize_schema
 
 
@@ -310,6 +312,12 @@ class SqliteInboxRepository:
         row = self.connection.execute("SELECT * FROM reply_drafts WHERE draft_run_id=?", (run_id,)).fetchone()
         return _persisted_reply_draft_from_row(row) if row else None
 
+    def get_reply_draft_run_fingerprint(self, run_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT input_fingerprint FROM reply_draft_runs WHERE id=? AND status='succeeded'", (run_id,),
+        ).fetchone()
+        return row["input_fingerprint"] if row else None
+
     def get_reply_draft_grounding(self, reply_draft_id: int) -> tuple[int, ...]:
         rows = self.connection.execute(
             "SELECT knowledge_chunk_id FROM reply_draft_grounding WHERE reply_draft_id=? ORDER BY knowledge_chunk_id",
@@ -355,6 +363,112 @@ class SqliteInboxRepository:
                            item["chunk_text"], float(item["score"]), item["rank"])
             for item in rows
         ]
+
+    def get_policy_decision_by_fingerprint(self, conversation_id: int, input_fingerprint: str) -> PersistedPolicyDecision | None:
+        row = self.connection.execute(
+            "SELECT * FROM policy_decisions WHERE conversation_id=? AND input_fingerprint=?",
+            (conversation_id, input_fingerprint),
+        ).fetchone()
+        return _persisted_policy_decision_from_row(row) if row else None
+
+    def create_policy_decision_and_review(
+        self, *, conversation_id: int, conversation_analysis_id: int, reply_draft_id: int,
+        input_fingerprint: str, decision: PolicyDecision, review_type: str | None,
+    ) -> tuple[PersistedPolicyDecision, HumanReviewItem | None]:
+        """Atomically persist immutable policy provenance and any initial review queue state."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """INSERT INTO policy_decisions (
+                    conversation_id, reply_draft_id, conversation_analysis_id, policy_version, decision,
+                    reason_codes_json, primary_reason, input_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (conversation_id, reply_draft_id, conversation_analysis_id, decision.rule_version,
+                 decision.decision, json.dumps(list(decision.reason_codes), separators=(",", ":")),
+                 decision.primary_reason, input_fingerprint),
+            )
+            policy_id = cursor.lastrowid
+            persisted = PersistedPolicyDecision(
+                policy_id, conversation_id, reply_draft_id, conversation_analysis_id, input_fingerprint, decision,
+            )
+            self._record_audit_event(AuditEvent(
+                "policy_decision_recorded", "policy_decision", policy_id,
+                metadata={"conversation_id": conversation_id, "reply_draft_id": reply_draft_id,
+                          "decision": decision.decision, "reason_codes": list(decision.reason_codes),
+                          "policy_version": decision.rule_version},
+            ))
+            if review_type is None:
+                return persisted, None
+            review_cursor = self.connection.execute(
+                """INSERT INTO human_review_items (
+                    policy_decision_id, conversation_id, reply_draft_id, review_type, status
+                ) VALUES (?, ?, ?, ?, 'pending')""",
+                (policy_id, conversation_id, reply_draft_id, review_type),
+            )
+            review_id = review_cursor.lastrowid
+            self.connection.execute(
+                "INSERT INTO human_review_events (review_item_id, event_type) VALUES (?, 'created')", (review_id,),
+            )
+            self._record_audit_event(AuditEvent(
+                "human_review_created", "human_review_item", review_id,
+                metadata={"policy_decision_id": policy_id, "review_type": review_type, "status": "pending"},
+            ))
+            return persisted, HumanReviewItem(
+                review_id, policy_id, conversation_id, reply_draft_id, review_type, "pending",
+            )
+
+    def get_review_item_for_policy_decision(self, policy_decision_id: int) -> HumanReviewItem | None:
+        row = self.connection.execute(
+            "SELECT * FROM human_review_items WHERE policy_decision_id=?", (policy_decision_id,),
+        ).fetchone()
+        return _review_item_from_row(row) if row else None
+
+    def get_review_item(self, review_item_id: int) -> HumanReviewItem | None:
+        row = self.connection.execute("SELECT * FROM human_review_items WHERE id=?", (review_item_id,)).fetchone()
+        return _review_item_from_row(row) if row else None
+
+    def list_pending_review_items(self) -> list[HumanReviewItem]:
+        rows = self.connection.execute(
+            "SELECT * FROM human_review_items WHERE status='pending' ORDER BY created_at ASC, id ASC",
+        ).fetchall()
+        return [_review_item_from_row(row) for row in rows]
+
+    def list_review_events(self, review_item_id: int) -> list[HumanReviewEvent]:
+        rows = self.connection.execute(
+            "SELECT * FROM human_review_events WHERE review_item_id=? ORDER BY id ASC", (review_item_id,),
+        ).fetchall()
+        return [_review_event_from_row(row) for row in rows]
+
+    def transition_review_item(self, review_item_id: int, status: str, reviewer_id: str,
+                               note: str | None) -> HumanReviewItem:
+        event_by_status = {
+            "approved": "human_review_approved", "rejected": "human_review_rejected",
+            "changes_requested": "human_review_changes_requested",
+        }
+        if status not in event_by_status:
+            raise ValueError("Unsupported review transition")
+        with self.connection:
+            row = self.connection.execute("SELECT * FROM human_review_items WHERE id=?", (review_item_id,)).fetchone()
+            if not row:
+                raise ValueError("Review item does not exist")
+            if row["status"] != "pending":
+                raise ValueError("Only pending review items may transition")
+            if row["review_type"] == "blocked_resolution" and status == "approved":
+                raise ValueError("Blocked review items cannot be approved")
+            self.connection.execute(
+                """UPDATE human_review_items SET status=?, reviewer_id=?, updated_at=CURRENT_TIMESTAMP,
+                   resolved_at=CURRENT_TIMESTAMP WHERE id=?""", (status, reviewer_id, review_item_id),
+            )
+            self.connection.execute(
+                """INSERT INTO human_review_events (review_item_id, event_type, reviewer_id, note)
+                   VALUES (?, ?, ?, ?)""", (review_item_id, status, reviewer_id, note),
+            )
+            self._record_audit_event(AuditEvent(
+                event_by_status[status], "human_review_item", review_item_id,
+                metadata={"policy_decision_id": row["policy_decision_id"], "review_type": row["review_type"],
+                          "status": status, "reviewer_id": reviewer_id},
+            ))
+            updated = self.connection.execute("SELECT * FROM human_review_items WHERE id=?", (review_item_id,)).fetchone()
+            return _review_item_from_row(updated)
 
     def _get_or_create_conversation(self, provider: str, provider_thread_id: str, latest_message_at: str) -> tuple[Conversation, bool]:
         existing = self.get_conversation_by_provider_thread_id(provider, provider_thread_id)
@@ -447,6 +561,29 @@ def _persisted_reply_draft_from_row(row: sqlite3.Row) -> PersistedReplyDraft:
         float(row["confidence"]), bool(row["needs_review"]), row["review_reason"], row["response_language"],
     )
     return PersistedReplyDraft(row["id"], row["draft_run_id"], row["conversation_id"], row["latest_message_id"], draft)
+
+
+def _persisted_policy_decision_from_row(row: sqlite3.Row) -> PersistedPolicyDecision:
+    decision = PolicyDecision(
+        row["decision"], row["policy_version"], tuple(json.loads(row["reason_codes_json"])), row["primary_reason"],
+    )
+    return PersistedPolicyDecision(
+        row["id"], row["conversation_id"], row["reply_draft_id"], row["conversation_analysis_id"],
+        row["input_fingerprint"], decision,
+    )
+
+
+def _review_item_from_row(row: sqlite3.Row) -> HumanReviewItem:
+    return HumanReviewItem(
+        row["id"], row["policy_decision_id"], row["conversation_id"], row["reply_draft_id"],
+        row["review_type"], row["status"], row["reviewer_id"], row["resolved_at"],
+    )
+
+
+def _review_event_from_row(row: sqlite3.Row) -> HumanReviewEvent:
+    return HumanReviewEvent(
+        row["id"], row["review_item_id"], row["event_type"], row["reviewer_id"], row["note"], row["created_at"],
+    )
 
 
 def _safe_metadata(message: InboxMessage) -> Mapping[str, object]:

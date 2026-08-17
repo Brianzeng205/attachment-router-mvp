@@ -173,4 +173,40 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     )""")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_reply_draft_runs_conversation ON reply_draft_runs(conversation_id, status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_reply_draft_grounding_chunk ON reply_draft_grounding(knowledge_chunk_id)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS policy_decisions (
+        id INTEGER PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        reply_draft_id INTEGER NOT NULL REFERENCES reply_drafts(id),
+        conversation_analysis_id INTEGER NOT NULL REFERENCES conversation_analyses(id),
+        policy_version TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('ready_for_review','human_review_required','blocked','no_action')),
+        reason_codes_json TEXT NOT NULL,
+        primary_reason TEXT NOT NULL,
+        input_fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(conversation_id, input_fingerprint)
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS human_review_items (
+        id INTEGER PRIMARY KEY,
+        policy_decision_id INTEGER NOT NULL UNIQUE REFERENCES policy_decisions(id),
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        reply_draft_id INTEGER NOT NULL REFERENCES reply_drafts(id),
+        review_type TEXT NOT NULL CHECK(review_type IN ('standard_review','required_review','blocked_resolution')),
+        status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','changes_requested')),
+        reviewer_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        resolved_at TEXT
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS human_review_events (
+        id INTEGER PRIMARY KEY,
+        review_item_id INTEGER NOT NULL REFERENCES human_review_items(id),
+        event_type TEXT NOT NULL CHECK(event_type IN ('created','approved','rejected','changes_requested')),
+        reviewer_id TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_policy_decisions_draft ON policy_decisions(reply_draft_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_pending ON human_review_items(status, created_at, id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_item ON human_review_events(review_item_id, id)")
     connection.commit()

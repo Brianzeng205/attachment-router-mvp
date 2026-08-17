@@ -17,6 +17,8 @@ from .knowledge_retrieval_service import KnowledgeRetrievalService
 from .claude_reply_draft_generator import ClaudeGroundedReplyGenerator
 from .reply_draft_input import ReplyDraftInput
 from .reply_draft_service import ReplyDraftService
+from .decision_policy import DefaultDecisionPolicy
+from .review_queue_service import ReviewQueueService
 from .orchestrator import AttachmentProcessor, ProcessingSummary
 from .state import SqliteStateManager
 
@@ -58,8 +60,14 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
                 generator_version=settings.reply_draft_generator_version, model=settings.reply_draft_generator_model,
                 prompt_version=settings.reply_draft_prompt_version,
             )
+            decision_policy = DefaultDecisionPolicy()
+            review_queue = ReviewQueueService(repository, policy_configuration={
+                "rule_version": decision_policy.rule_version,
+                "min_draft_confidence": decision_policy.min_draft_confidence,
+                "min_conversation_confidence": decision_policy.min_conversation_confidence,
+            })
             processor = AttachmentProcessor(_StaticEmailClient(messages), build_classifier(settings), build_drive(settings), SqliteStateManager(settings.state_db_path), settings)
-            return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, reply_draft_service=drafting, thread_context_builder=context_builder, attachment_processor=processor)
+            return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, reply_draft_service=drafting, thread_context_builder=context_builder, decision_policy=decision_policy, review_queue_service=review_queue, attachment_processor=processor)
         finally:
             repository.close()
     except Exception:
@@ -70,8 +78,9 @@ def run_once(settings: Settings | None = None) -> ProcessingSummary:
 
 def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox_analysis_service,
                        conversation_analysis_service, knowledge_retrieval_service, attachment_processor,
-                       reply_draft_service=None, thread_context_builder=None):
-    """Injectable Phase-5 execution seam; services own analysis, retrieval, and draft idempotency."""
+                       reply_draft_service=None, thread_context_builder=None,
+                       decision_policy=None, review_queue_service=None):
+    """Injectable Phase-6 seam; domain services own policy rules and persistence idempotency."""
     try:
         message_ingestion_service.ingest_all(messages)
         inbox_analysis_service.analyze_all(messages)
@@ -90,12 +99,25 @@ def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox
                         conversation, repository.list_messages_for_conversation(conversation.id),
                     )
                     try:
-                        reply_draft_service.create_draft(
+                        draft_outcome = reply_draft_service.create_draft(
                             ReplyDraftInput.from_context(context, analysis, retrieval_run_id, matches),
                             conversation_analysis_id=analysis_id,
                         )
+                        if decision_policy and review_queue_service and draft_outcome.draft:
+                            persisted_draft = draft_outcome.draft
+                            draft_fingerprint = repository.get_reply_draft_run_fingerprint(persisted_draft.draft_run_id)
+                            if not draft_fingerprint:
+                                raise ValueError("Successful reply draft is missing its input fingerprint")
+                            policy_decision = decision_policy.evaluate(
+                                conversation_analysis=analysis, reply_draft=persisted_draft.draft,
+                            )
+                            review_queue_service.record_decision(
+                                conversation_id=conversation.id, conversation_analysis_id=analysis_id,
+                                reply_draft_id=persisted_draft.id, reply_draft_fingerprint=draft_fingerprint,
+                                decision=policy_decision,
+                            )
                     except Exception:
-                        logging.getLogger(__name__).exception("Reply drafting failed conversation_id=%s", conversation.id)
+                        logging.getLogger(__name__).exception("Local drafting/policy/review failed conversation_id=%s", conversation.id)
     except Exception:
         logging.getLogger(__name__).exception("Inbox agent branch failed")
     return attachment_processor.process_all()
