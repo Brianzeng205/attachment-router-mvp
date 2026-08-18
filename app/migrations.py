@@ -212,6 +212,58 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     review_columns = {row[1] for row in connection.execute("PRAGMA table_info(human_review_items)").fetchall()}
     if "approved_draft_body" not in review_columns:
         connection.execute("ALTER TABLE human_review_items ADD COLUMN approved_draft_body TEXT")
+    connection.execute("""CREATE TABLE IF NOT EXISTS execution_intents (
+        execution_id TEXT PRIMARY KEY,
+        source_review_item_id INTEGER NOT NULL UNIQUE REFERENCES human_review_items(id),
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        provider_thread_id TEXT NOT NULL,
+        in_reply_to_provider_message_id TEXT NOT NULL,
+        action_type TEXT NOT NULL CHECK(action_type IN ('send_approved_reply')),
+        approved_body TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('pending','processing','retry_wait','completed','failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        next_attempt_at TEXT,
+        claim_token TEXT,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        lease_expires_at TEXT,
+        completed_at TEXT,
+        failure_code TEXT,
+        failure_metadata_json TEXT,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(length(approved_body) BETWEEN 1 AND 50000),
+        CHECK((status = 'processing' AND claim_token IS NOT NULL AND claimed_by IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+              OR (status != 'processing' AND claim_token IS NULL AND claimed_by IS NULL
+                  AND claimed_at IS NULL AND lease_expires_at IS NULL)),
+        CHECK((status = 'retry_wait' AND next_attempt_at IS NOT NULL)
+              OR (status != 'retry_wait' AND next_attempt_at IS NULL)),
+        CHECK((status = 'completed' AND completed_at IS NOT NULL)
+              OR (status != 'completed' AND completed_at IS NULL))
+    )""")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_claimable "
+        "ON execution_intents(status, next_attempt_at, created_at, execution_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_processing_lease "
+        "ON execution_intents(status, lease_expires_at)"
+    )
+    connection.execute("""CREATE TABLE IF NOT EXISTS execution_events (
+        id INTEGER PRIMARY KEY,
+        execution_id TEXT NOT NULL REFERENCES execution_intents(execution_id),
+        event_type TEXT NOT NULL CHECK(event_type IN
+            ('created','claimed','completed','retry_scheduled','failed','claim_recovered')),
+        attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL
+    )""")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_intent ON execution_events(execution_id, id)"
+    )
     connection.execute("""CREATE TABLE IF NOT EXISTS runtime_runs (
         id INTEGER PRIMARY KEY,
         trigger_type TEXT NOT NULL,

@@ -60,6 +60,36 @@ The queue defaults to pending items and can be filtered to approved or rejected 
 
 This console has no authentication and is intended only for a trusted local/private operator environment. It must not be exposed to the public internet. Other current limitations are a single operator identity entered per decision, plain-text message/draft rendering, no decision reversal, and no downstream Gmail action.
 
+## Approved action execution queue (Phase 8B)
+
+Phase 8B adds a durable orchestration boundary after human approval and before any future Gmail adapter. In the same SQLite transaction that changes a review from `pending` to `approved`, the repository creates one `send_approved_reply` execution intent. The intent stores the exact approved body, stable provider thread/message identifiers, a deterministic execution ID and idempotency key, and no credentials or unrelated message content. A database uniqueness constraint on the source review ID makes enqueue idempotent even across concurrent callers. The original AI draft, the review's approved snapshot, and the execution snapshot remain separate records; queue processing never regenerates or edits them.
+
+The state machine is:
+
+```text
+pending → processing → completed
+                 ↘ retry_wait → processing
+                 ↘ failed
+```
+
+`completed` and `failed` are terminal. Claiming is an atomic SQLite transaction. Each claim has an unpredictable token, worker identifier, claim timestamp, and lease expiry; completion and failure updates require the current token. An expired claim is explicitly recovered into a retry state (or terminal failure at the configured maximum), so a process crash does not strand work and a stale worker cannot overwrite its successor. Retryable failures use deterministic bounded exponential backoff and are not claimable before `next_attempt_at`; permanent or exhausted failures become terminal. Persisted failure information is restricted to a safe error code and small allowlisted metadata.
+
+Inspect the credential-free queue with:
+
+```bash
+python -m app.execution_status
+```
+
+For a database containing Phase 8A approvals created before this queue existed, run:
+
+```bash
+python -m app.execution_status --reconcile
+```
+
+Reconciliation considers only completed `approved` reviews with a valid persisted approved body and provider identity. It skips malformed, pending, and rejected records, and repeated runs do not duplicate intents. Neither inspection nor reconciliation needs Gmail, Drive, Claude, internet connectivity, or OAuth credentials, and neither processes an action.
+
+Phase 8B intentionally registers no production action executor and does **not** send email, create Gmail drafts, modify Gmail, add Gmail write scopes, or invoke Claude. `ActionExecutor` is only a typed boundary for a future Phase 8C adapter, which must consume the stable execution identity/idempotency key. The guarantee here is exactly one durable execution intent per eligible approved review, idempotent enqueue, atomic claim, durable transitions, and stale-claim protection—not mathematically strict exactly-once external execution.
+
 ## Google Drive setup
 
 1. Create or choose a Google Cloud project in the [Google Cloud Console](https://console.cloud.google.com/).
