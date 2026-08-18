@@ -13,6 +13,7 @@ from .inbox_repository import SqliteInboxRepository
 from .process_lock import ProcessLock, poll_lock_path
 from .runtime_models import PollCycleReport, RuntimeExecutionResult
 from .database import DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+from .logging_config import set_run_id
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class RuntimeCoordinator:
 
     def execute_once(self) -> RuntimeExecutionResult:
         if not self._lock.acquire():
-            logger.info("Polling invocation skipped lock_outcome=already_held")
+            logger.info("event=lock_skipped lock_outcome=already_held")
             return RuntimeExecutionResult("skipped_locked")
         run_id: int | None = None
         try:
@@ -52,11 +53,15 @@ class RuntimeCoordinator:
                     trigger_type=self._trigger_type, instance_id=self._instance_id, lock_outcome="acquired",
                 )
                 run_id = run.id
+                set_run_id(run_id)
+                logger.info("event=lock_acquired instance_id=%s trigger_type=%s", self._instance_id[:8], self._trigger_type)
             finally:
                 repository.close()
 
             try:
+                logger.info("event=poll_started")
                 result = self._business_run_once()
+                logger.info("event=poll_completed")
             except KeyboardInterrupt as exc:
                 self._finalize(run_id, "interrupted", exc)
                 raise
@@ -68,14 +73,24 @@ class RuntimeCoordinator:
             return RuntimeExecutionResult(status, run_id, result)
         finally:
             self._lock.release()
+            set_run_id(None)
 
     def _finalize(
         self, run_id: int, status: str, error: BaseException | None = None,
         report: PollCycleReport | None = None,
     ) -> None:
+        error_class = _normalized_error_class(error)
         repository = SqliteInboxRepository(self._database_path, self._sqlite_busy_timeout_ms)
         try:
-            repository.finalize_runtime_run(run_id, status, _normalized_error_class(error), report)
+            repository.finalize_runtime_run(run_id, status, error_class, report)
+            if status == "completed":
+                logger.info("event=runtime_completed status=%s", status)
+            elif status == "partial":
+                logger.info("event=runtime_partial status=%s", status)
+            elif status == "failed":
+                logger.warning("event=runtime_failed status=%s error_class=%s", status, error_class or "unknown")
+            elif status == "interrupted":
+                logger.warning("event=runtime_interrupted status=%s", status)
         finally:
             repository.close()
 

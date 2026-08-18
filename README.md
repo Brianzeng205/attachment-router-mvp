@@ -29,6 +29,21 @@ See [Scheduled Windows deployment](docs/windows-task-scheduler.md) for the exact
 
 `ALLOWED_DRIVE_FOLDERS` is a JSON map from a classifier `target_folder` name to a Google Drive folder ID. Claude can never select a folder outside that map. The Needs Review folder is separately configured. The Drive client accepts only IDs in these two configuration values; it never creates folders.
 
+## Operational observability
+
+Each polling invocation is recorded in the SQLite database configured by `STATE_DB_PATH`, including its lifecycle status, safe error class, and content-free processing counts. Inspect the 20 most recent invocations with `python -m app.runtime_status`. This status command needs only `STATE_DB_PATH` (default: `data/state.sqlite3`); it does not require Gmail, Drive, or Anthropic configuration or credentials.
+
+Runtime and provider-retry logs use stable `key=value` fields such as `event`, `status`, `run_id`, `provider`, `operation`, and `error_class`. Operational events intentionally omit message bodies, sender addresses, filenames, OAuth tokens, API keys, and exception messages.
+
+Logging is configured with these environment variables:
+
+- `LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (default: `INFO`).
+- `LOG_FILE`: optional rotating log path. Leave empty for console-only logging; `.env.example` uses `logs/agent.log`.
+- `LOG_MAX_BYTES`: file size in bytes before rotation, from 1,024 through 1,073,741,824 (default: 5,242,880).
+- `LOG_BACKUP_COUNT`: retained rotated files, from 0 through 100 (default: 3).
+
+The application creates the log directory when file logging is enabled. Local logs and runtime SQLite artifacts under `data/` are ignored by Git; other project files placed in `data/` are not ignored wholesale.
+
 ## Google Drive setup
 
 1. Create or choose a Google Cloud project in the [Google Cloud Console](https://console.cloud.google.com/).

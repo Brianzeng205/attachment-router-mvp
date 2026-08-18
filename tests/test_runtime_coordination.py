@@ -160,9 +160,17 @@ class RuntimeCoordinationTests(unittest.TestCase):
                                    "outcome_status", "created_at"])
 
     def test_named_main_invokes_coordinator_without_constructing_business_early(self):
-        settings = SimpleNamespace(state_db_path=self.database_path, sqlite_busy_timeout_ms=1234)
+        from pathlib import Path
+        settings = SimpleNamespace(
+            state_db_path=self.database_path,
+            sqlite_busy_timeout_ms=1234,
+            log_level="INFO",
+            log_file=None,
+            log_max_bytes=5*1024*1024,
+            log_backup_count=3,
+        )
         coordinator = Mock()
-        coordinator.execute_once.return_value = SimpleNamespace(status="skipped_locked")
+        coordinator.execute_once.return_value = SimpleNamespace(status="skipped_locked", runtime_run_id=None)
         with patch.object(runtime_main.Settings, "from_env", return_value=settings), \
              patch.object(runtime_main, "RuntimeCoordinator", return_value=coordinator) as coordinator_type, \
              patch.object(runtime_main, "run_once") as business:
