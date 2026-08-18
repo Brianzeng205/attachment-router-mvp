@@ -54,6 +54,10 @@ class Settings:
     log_file: Path | None = None
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 3
+    gmail_compose_oauth_client_secrets_file: Path = Path("secrets/google-oauth-client.json")
+    gmail_compose_oauth_token_file: Path = Path("secrets/google-gmail-compose-token.json")
+    gmail_compose_account_email: str | None = None
+    max_gmail_draft_bytes: int = 1_000_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -172,6 +176,12 @@ class Settings:
             retry_max_attempts, retry_initial_delay, retry_max_delay, retry_multiplier, retry_jitter_ratio,
             request_timeout, sqlite_busy_timeout_ms,
             log_level, log_file, log_max_bytes, log_backup_count,
+            Path(os.environ.get("GMAIL_COMPOSE_OAUTH_CLIENT_SECRETS_FILE",
+                                os.environ.get("GMAIL_OAUTH_CLIENT_SECRETS_FILE",
+                                               os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS_FILE", "secrets/google-oauth-client.json")))),
+            Path(os.environ.get("GMAIL_COMPOSE_OAUTH_TOKEN_FILE", "secrets/google-gmail-compose-token.json")),
+            os.environ.get("GMAIL_COMPOSE_ACCOUNT_EMAIL") or None,
+            int(os.environ.get("MAX_GMAIL_DRAFT_BYTES", "1000000")),
         )
 
     @property

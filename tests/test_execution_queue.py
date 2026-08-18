@@ -40,7 +40,7 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
         item, intent = self.approved(body)
         self.assertEqual(intent.approved_body, body)
         self.assertEqual(intent.source_review_item_id, item.id)
-        self.assertEqual(intent.action_type, "send_approved_reply")
+        self.assertEqual(intent.action_type, "create_gmail_draft")
         self.assertEqual(intent.status, "pending")
         self.assertEqual(self.service.detail(item.id).original_draft_body, "Confirmed local reply body.")
         self.repository.connection.execute(
@@ -90,13 +90,15 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
         ).fetchone()[0], 1)
         with self.assertRaises(sqlite3.IntegrityError):
             self.repository.connection.execute(
-                """INSERT INTO execution_intents
+                """INSERT INTO execution_intents (
+                   execution_id, source_review_item_id, conversation_id, provider_thread_id,
+                   in_reply_to_provider_message_id, action_type, approved_body, idempotency_key,
+                   status, attempt_count, created_at, updated_at)
                    SELECT 'exec_00000000000000000000000000000000', source_review_item_id,
                           conversation_id, provider_thread_id, in_reply_to_provider_message_id,
                           action_type, approved_body, 'different-key', status, attempt_count,
-                          next_attempt_at, claim_token, claimed_by, claimed_at, lease_expires_at,
-                          completed_at, failure_code, failure_metadata_json, schema_version, created_at, updated_at
-                   FROM execution_intents WHERE execution_id=?""", (expected.execution_id,),
+                          created_at, updated_at FROM execution_intents WHERE execution_id=?""",
+                (expected.execution_id,),
             )
 
     def test_legacy_reconciliation_is_safe_and_idempotent(self):
@@ -148,12 +150,18 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
     def test_completion_is_terminal_and_stale_or_duplicate_completion_is_rejected(self):
         self.approved()
         claimed = self.queue.claim_next("worker-a")
-        completed = self.queue.mark_completed(claimed.execution_id, claimed.claim_token)
+        completed = self.queue.mark_gmail_draft_completed(
+            claimed.execution_id, claimed.claim_token, draft_id="draft-a", message_id="message-a",
+            thread_id=claimed.provider_thread_id,
+        )
         self.assertEqual(completed.status, "completed")
         self.assertIsNotNone(completed.completed_at)
         self.assertIsNone(self.queue.claim_next("worker-b"))
         with self.assertRaises(ExecutionClaimConflictError):
-            self.queue.mark_completed(claimed.execution_id, claimed.claim_token)
+            self.queue.mark_gmail_draft_completed(
+                claimed.execution_id, claimed.claim_token, draft_id="draft-b", message_id="message-b",
+                thread_id=claimed.provider_thread_id,
+            )
 
     def test_retry_schedule_due_time_and_max_attempts(self):
         self.approved()
@@ -199,11 +207,17 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
         current = self.queue.claim_next("current-worker")
         self.assertNotEqual(current.claim_token, stale.claim_token)
         with self.assertRaises(ExecutionClaimConflictError):
-            self.queue.mark_completed(stale.execution_id, stale.claim_token)
+            self.queue.mark_gmail_draft_completed(
+                stale.execution_id, stale.claim_token, draft_id="stale-draft", message_id=None,
+                thread_id=stale.provider_thread_id,
+            )
         with self.assertRaises(ExecutionClaimConflictError):
             self.queue.mark_failed(stale.execution_id, stale.claim_token, retryable=False,
                                    error_code="stale_worker")
-        self.assertEqual(self.queue.mark_completed(current.execution_id, current.claim_token).status, "completed")
+        self.assertEqual(self.queue.mark_gmail_draft_completed(
+            current.execution_id, current.claim_token, draft_id="current-draft", message_id=None,
+            thread_id=current.provider_thread_id,
+        ).status, "completed")
 
     def test_restart_persistence_counts_and_audit_history(self):
         _, intent = self.approved()
@@ -224,7 +238,10 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
              self.assertLogs(level=logging.INFO) as captured:
             _, intent = self.approved(secret)
             claimed = self.queue.claim_next("no-side-effects")
-            self.queue.mark_completed(intent.execution_id, claimed.claim_token)
+            self.queue.mark_gmail_draft_completed(
+                intent.execution_id, claimed.claim_token, draft_id="test-draft", message_id=None,
+                thread_id=intent.provider_thread_id,
+            )
         gmail.assert_not_called()
         claude.assert_not_called()
         self.assertNotIn(secret, "\n".join(captured.output))
@@ -237,4 +254,3 @@ class Phase8BExecutionQueueTests(ReviewQueueTests):
         ).fetchall()}
         self.assertIn("idx_execution_claimable", indexes)
         self.assertIn("idx_execution_processing_lease", indexes)
-

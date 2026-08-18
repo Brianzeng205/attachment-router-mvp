@@ -18,6 +18,9 @@ class InboxMessage:
     received_at: str
     ingestion_state: str
     content_hash: str
+    message_id_header: str | None = None
+    reply_to: str | None = None
+    references: tuple[str, ...] = ()
     id: int | None = None
     conversation_id: int | None = None
 

@@ -57,6 +57,9 @@ class MessageIngestionService:
             received_at=message.received_at,
             ingestion_state="ingested",
             content_hash=_content_hash(message, self._provider),
+            message_id_header=message.message_id_header.strip() if message.message_id_header else None,
+            reply_to=message.reply_to.strip() if message.reply_to else None,
+            references=tuple(value.strip() for value in message.references if value.strip()),
         )
         _, _, message_created, _ = self._repository.ingest(normalized)
         return message_created
@@ -73,6 +76,9 @@ def _content_hash(message: EmailMessage, provider: str) -> str:
         "subject": message.subject.strip(),
         "body_text": message.body,
         "received_at": message.received_at,
+        "message_id_header": message.message_id_header,
+        "reply_to": message.reply_to,
+        "references": list(message.references),
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

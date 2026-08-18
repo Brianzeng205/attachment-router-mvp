@@ -26,7 +26,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Reconciled {len(service.reconcile_approved_reviews())} execution intent(s).")
         counts = service.status_counts()
         print("Execution queue: " + " ".join(f"{key}={counts[key]}" for key in
-              ("pending", "processing", "retry_wait", "completed", "failed")))
+              ("pending", "processing", "retry_wait", "completed", "failed", "outcome_unknown")))
+        for item in service.list_items():
+            result = service.get_gmail_draft_result(item.execution_id)
+            provider_state = "created" if result else ("outcome_unknown" if item.status == "outcome_unknown" else "none")
+            draft = f" draft_id={result.provider_draft_id}" if result else ""
+            failure = f" failure={item.failure_code}" if item.failure_code else ""
+            print(f"execution_id={item.execution_id} status={item.status} action={item.action_type} "
+                  f"provider=gmail provider_state={provider_state}{draft}{failure}")
         return 0
     except Exception as exc:
         print(f"Error: {type(exc).__name__}", file=sys.stderr)

@@ -45,6 +45,13 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             UNIQUE (provider, provider_message_id)
         )"""
     )
+    message_columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)").fetchall()}
+    for column, declaration in (
+        ("message_id_header", "TEXT"), ("reply_to", "TEXT"),
+        ("references_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ):
+        if column not in message_columns:
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column} {declaration}")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS audit_events (
             id INTEGER PRIMARY KEY,
@@ -212,58 +219,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     review_columns = {row[1] for row in connection.execute("PRAGMA table_info(human_review_items)").fetchall()}
     if "approved_draft_body" not in review_columns:
         connection.execute("ALTER TABLE human_review_items ADD COLUMN approved_draft_body TEXT")
-    connection.execute("""CREATE TABLE IF NOT EXISTS execution_intents (
-        execution_id TEXT PRIMARY KEY,
-        source_review_item_id INTEGER NOT NULL UNIQUE REFERENCES human_review_items(id),
-        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-        provider_thread_id TEXT NOT NULL,
-        in_reply_to_provider_message_id TEXT NOT NULL,
-        action_type TEXT NOT NULL CHECK(action_type IN ('send_approved_reply')),
-        approved_body TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL CHECK(status IN ('pending','processing','retry_wait','completed','failed')),
-        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
-        next_attempt_at TEXT,
-        claim_token TEXT,
-        claimed_by TEXT,
-        claimed_at TEXT,
-        lease_expires_at TEXT,
-        completed_at TEXT,
-        failure_code TEXT,
-        failure_metadata_json TEXT,
-        schema_version INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        CHECK(length(approved_body) BETWEEN 1 AND 50000),
-        CHECK((status = 'processing' AND claim_token IS NOT NULL AND claimed_by IS NOT NULL
-               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
-              OR (status != 'processing' AND claim_token IS NULL AND claimed_by IS NULL
-                  AND claimed_at IS NULL AND lease_expires_at IS NULL)),
-        CHECK((status = 'retry_wait' AND next_attempt_at IS NOT NULL)
-              OR (status != 'retry_wait' AND next_attempt_at IS NULL)),
-        CHECK((status = 'completed' AND completed_at IS NOT NULL)
-              OR (status != 'completed' AND completed_at IS NULL))
-    )""")
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_execution_claimable "
-        "ON execution_intents(status, next_attempt_at, created_at, execution_id)"
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_execution_processing_lease "
-        "ON execution_intents(status, lease_expires_at)"
-    )
-    connection.execute("""CREATE TABLE IF NOT EXISTS execution_events (
-        id INTEGER PRIMARY KEY,
-        execution_id TEXT NOT NULL REFERENCES execution_intents(execution_id),
-        event_type TEXT NOT NULL CHECK(event_type IN
-            ('created','claimed','completed','retry_scheduled','failed','claim_recovered')),
-        attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
-        failure_code TEXT,
-        created_at TEXT NOT NULL
-    )""")
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_execution_events_intent ON execution_events(execution_id, id)"
-    )
+    _initialize_execution_schema(connection)
     connection.execute("""CREATE TABLE IF NOT EXISTS runtime_runs (
         id INTEGER PRIMARY KEY,
         trigger_type TEXT NOT NULL,
@@ -297,3 +253,126 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_runtime_runs_status ON runtime_runs(status, id)")
     connection.commit()
+
+
+def _initialize_execution_schema(connection: sqlite3.Connection) -> None:
+    """Upgrade Phase 8B execution rows while retaining their original action provenance."""
+    existing_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_intents'"
+    ).fetchone()
+    existing_sql = existing_sql_row[0] if existing_sql_row else ""
+    if existing_sql and "outcome_unknown" not in existing_sql:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("ALTER TABLE execution_intents RENAME TO execution_intents_phase8b")
+        # The event table references the renamed table and must be rebuilt as well.
+        connection.execute("ALTER TABLE execution_events RENAME TO execution_events_phase8b")
+    connection.execute("""CREATE TABLE IF NOT EXISTS execution_intents (
+        execution_id TEXT PRIMARY KEY,
+        source_review_item_id INTEGER NOT NULL UNIQUE REFERENCES human_review_items(id),
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        provider_thread_id TEXT NOT NULL,
+        in_reply_to_provider_message_id TEXT NOT NULL,
+        action_type TEXT NOT NULL CHECK(action_type IN ('create_gmail_draft')),
+        legacy_action_type TEXT,
+        approved_body TEXT NOT NULL,
+        recipient TEXT,
+        subject TEXT,
+        in_reply_to_header TEXT,
+        references_json TEXT NOT NULL DEFAULT '[]',
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN
+            ('pending','processing','retry_wait','completed','failed','outcome_unknown')),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        next_attempt_at TEXT,
+        claim_token TEXT,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        lease_expires_at TEXT,
+        completed_at TEXT,
+        failure_code TEXT,
+        failure_metadata_json TEXT,
+        schema_version INTEGER NOT NULL DEFAULT 2,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(length(approved_body) BETWEEN 1 AND 50000),
+        CHECK((status = 'processing' AND claim_token IS NOT NULL AND claimed_by IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+              OR (status != 'processing' AND claim_token IS NULL AND claimed_by IS NULL
+                  AND claimed_at IS NULL AND lease_expires_at IS NULL)),
+        CHECK((status = 'retry_wait' AND next_attempt_at IS NOT NULL)
+              OR (status != 'retry_wait' AND next_attempt_at IS NULL)),
+        CHECK((status = 'completed' AND completed_at IS NOT NULL)
+              OR (status != 'completed' AND completed_at IS NULL))
+    )""")
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_intents_phase8b'"
+    ).fetchone():
+        connection.execute("""INSERT INTO execution_intents (
+            execution_id, source_review_item_id, conversation_id, provider_thread_id,
+            in_reply_to_provider_message_id, action_type, legacy_action_type, approved_body,
+            recipient, subject, in_reply_to_header, references_json, idempotency_key, status,
+            attempt_count, next_attempt_at, claim_token, claimed_by, claimed_at, lease_expires_at,
+            completed_at, failure_code, failure_metadata_json, schema_version, created_at, updated_at
+        ) SELECT old.execution_id, old.source_review_item_id, old.conversation_id,
+            old.provider_thread_id, old.in_reply_to_provider_message_id, 'create_gmail_draft',
+            old.action_type, old.approved_body, COALESCE(message.reply_to, message.sender),
+            message.subject, message.message_id_header, COALESCE(message.references_json, '[]'),
+            old.idempotency_key,
+            CASE WHEN old.status='completed' THEN 'failed' ELSE old.status END,
+            old.attempt_count, old.next_attempt_at,
+            old.claim_token, old.claimed_by, old.claimed_at, old.lease_expires_at,
+            CASE WHEN old.status='completed' THEN NULL ELSE old.completed_at END,
+            CASE WHEN old.status='completed' THEN 'legacy_completion_without_provider_result'
+                 ELSE old.failure_code END,
+            old.failure_metadata_json, 2,
+            old.created_at, old.updated_at
+        FROM execution_intents_phase8b old
+        LEFT JOIN human_review_items item ON item.id=old.source_review_item_id
+        LEFT JOIN reply_drafts draft ON draft.id=item.reply_draft_id
+        LEFT JOIN messages message ON message.id=draft.latest_message_id""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS execution_events (
+        id INTEGER PRIMARY KEY,
+        execution_id TEXT NOT NULL REFERENCES execution_intents(execution_id),
+        event_type TEXT NOT NULL CHECK(event_type IN
+            ('created','claimed','completed','retry_scheduled','failed','claim_recovered',
+             'gmail_draft_attempt_started','gmail_draft_created','gmail_draft_definitive_failure',
+             'gmail_draft_outcome_unknown','gmail_draft_reconciliation_confirmed')),
+        attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL
+    )""")
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_events_phase8b'"
+    ).fetchone():
+        connection.execute("""INSERT INTO execution_events
+            (id, execution_id, event_type, attempt_count, failure_code, created_at)
+            SELECT id, execution_id, event_type, attempt_count, failure_code, created_at
+            FROM execution_events_phase8b""")
+        connection.execute("DROP TABLE execution_events_phase8b")
+        connection.execute("DROP TABLE execution_intents_phase8b")
+        connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("""CREATE TABLE IF NOT EXISTS gmail_draft_results (
+        execution_id TEXT PRIMARY KEY REFERENCES execution_intents(execution_id),
+        provider TEXT NOT NULL CHECK(provider='gmail'),
+        provider_draft_id TEXT NOT NULL UNIQUE,
+        provider_message_id TEXT,
+        provider_thread_id TEXT NOT NULL,
+        reconciliation_method TEXT,
+        created_at TEXT NOT NULL
+    )""")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gmail_draft_result_execution ON gmail_draft_results(execution_id)")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS trg_gmail_draft_completion_requires_result
+        BEFORE UPDATE OF status ON execution_intents
+        WHEN NEW.status='completed' AND NOT EXISTS
+             (SELECT 1 FROM gmail_draft_results WHERE execution_id=NEW.execution_id)
+        BEGIN SELECT RAISE(ABORT, 'completed Gmail draft execution requires provider result'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS trg_gmail_draft_completed_insert_requires_result
+        BEFORE INSERT ON execution_intents WHEN NEW.status='completed'
+        BEGIN SELECT RAISE(ABORT, 'cannot insert completed Gmail draft execution directly'); END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS trg_gmail_draft_result_requires_execution
+        BEFORE INSERT ON gmail_draft_results WHEN NOT EXISTS
+             (SELECT 1 FROM execution_intents WHERE execution_id=NEW.execution_id)
+        BEGIN SELECT RAISE(ABORT, 'Gmail draft result requires execution'); END""")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_execution_claimable ON execution_intents(status, next_attempt_at, created_at, execution_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_execution_processing_lease ON execution_intents(status, lease_expires_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_intent ON execution_events(execution_id, id)")

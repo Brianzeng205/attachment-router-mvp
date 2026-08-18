@@ -41,7 +41,9 @@ class ReviewQueueTests(unittest.TestCase):
         self.path = Path(self.tempdir.name) / "state.sqlite3"
         self.repository = SqliteInboxRepository(self.path)
         email = EmailMessage("m-1", "customer@example.test", "Help", "private conversation body",
-                             "2026-08-17T10:00:00+00:00", (), "thread-1", ("support@example.test",))
+                             "2026-08-17T10:00:00+00:00", (), "thread-1", ("support@example.test",),
+                             "<source-m1@example.test>", "Customer <customer@example.test>",
+                             ("<older@example.test>",))
         MessageIngestionService(self.repository).ingest(email)
         self.conversation = self.repository.get_conversation_by_provider_thread_id("gmail", "thread-1")
         context = ThreadContextBuilder(10, 1_000).build(

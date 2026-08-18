@@ -19,7 +19,7 @@ from .execution_models import (
 logger = logging.getLogger(__name__)
 _WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
-_SAFE_METADATA_KEYS = frozenset({"provider_status", "operation", "reason_code", "retry_source"})
+_SAFE_METADATA_KEYS = frozenset({"provider_status", "provider_state", "operation", "reason_code", "retry_source"})
 
 
 class ExecutionQueueService:
@@ -87,6 +87,25 @@ class ExecutionQueueService:
     def status_counts(self) -> dict[str, int]:
         return self._repository.execution_status_counts()
 
+    def get_gmail_draft_result(self, execution_id: str):
+        return self._repository.get_gmail_draft_result(self._execution_id(execution_id))
+
+    def record_gmail_attempt_started(self, intent: ExecutionIntent) -> None:
+        if intent.status != "processing" or not intent.claim_token:
+            raise ExecutionClaimConflictError("Execution is not owned by the current worker")
+        self._repository.record_execution_event(
+            intent.execution_id, "gmail_draft_attempt_started", intent.attempt_count + 1,
+            self._format(self._now()),
+        )
+
+    def record_gmail_definitive_failure(self, intent: ExecutionIntent, error_code: str,
+                                        *, dispatched: bool = False) -> None:
+        self._repository.record_execution_event(
+            intent.execution_id, "gmail_draft_definitive_failure",
+            intent.attempt_count + int(dispatched),
+            self._format(self._now()), failure_code=error_code,
+        )
+
     def claim_next(self, worker_id: str) -> ExecutionIntent | None:
         if not isinstance(worker_id, str) or not _WORKER_ID.fullmatch(worker_id):
             raise ValueError("worker_id must be a bounded normalized identifier")
@@ -106,6 +125,11 @@ class ExecutionQueueService:
 
     def mark_completed(self, execution_id: str, claim_token: str) -> ExecutionIntent:
         execution_id, claim_token = self._claim_arguments(execution_id, claim_token)
+        current = self.get(execution_id)
+        if current.action_type == "create_gmail_draft":
+            raise ExecutionTransitionError(
+                "Gmail draft executions require an atomically persisted provider result"
+            )
         intent = self._repository.complete_execution(execution_id, claim_token, self._format(self._now()))
         if not intent:
             logger.warning("event=execution_claim_conflict execution_id=%s operation=complete", execution_id)
@@ -114,8 +138,60 @@ class ExecutionQueueService:
                     intent.execution_id, intent.source_review_item_id)
         return intent
 
+    def mark_gmail_draft_completed(self, execution_id: str, claim_token: str, *, draft_id: str,
+                                   message_id: str | None, thread_id: str) -> ExecutionIntent:
+        execution_id, claim_token = self._claim_arguments(execution_id, claim_token)
+        for value, name in ((draft_id, "draft_id"), (thread_id, "thread_id")):
+            if not isinstance(value, str) or not value.strip() or len(value) > 512:
+                raise ValueError(f"{name} must be a bounded provider identifier")
+        if message_id is not None and (not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512):
+            raise ValueError("message_id must be a bounded provider identifier")
+        intent = self._repository.complete_gmail_draft_execution(
+            execution_id, claim_token, draft_id=draft_id.strip(),
+            message_id=message_id.strip() if message_id else None, thread_id=thread_id.strip(),
+            now=self._format(self._now()),
+        )
+        if not intent:
+            raise ExecutionClaimConflictError("Execution claim is missing, stale, or no longer processing")
+        logger.info("event=gmail_draft_created execution_id=%s review_item_id=%s provider=gmail provider_state=created draft_id=%s",
+                    intent.execution_id, intent.source_review_item_id, draft_id)
+        return intent
+
+    def mark_gmail_outcome_unknown(self, execution_id: str, claim_token: str,
+                                   *, error_code: str = "gmail_create_outcome_unknown") -> ExecutionIntent:
+        execution_id, claim_token = self._claim_arguments(execution_id, claim_token)
+        intent = self._repository.mark_gmail_outcome_unknown(
+            execution_id, claim_token, failure_code=error_code, now=self._format(self._now()),
+        )
+        if not intent:
+            raise ExecutionClaimConflictError("Execution claim is missing, stale, or no longer processing")
+        logger.warning("event=gmail_draft_outcome_unknown execution_id=%s review_item_id=%s provider=gmail provider_state=outcome_unknown error_category=%s",
+                       execution_id, intent.source_review_item_id, error_code)
+        return intent
+
+    def reconcile_gmail_draft(self, execution_id: str, *, draft_id: str,
+                              thread_id: str, message_id: str | None = None) -> ExecutionIntent:
+        execution_id = self._execution_id(execution_id)
+        for value, name in ((draft_id, "draft_id"), (thread_id, "thread_id")):
+            if not isinstance(value, str) or not value.strip() or len(value) > 512:
+                raise ValueError(f"{name} must be a bounded provider identifier")
+        if message_id is not None and (not message_id.strip() or len(message_id) > 512):
+            raise ValueError("message_id must be a bounded provider identifier")
+        intent = self._repository.reconcile_gmail_draft_result(
+            execution_id, draft_id=draft_id.strip(), message_id=message_id.strip() if message_id else None,
+            thread_id=thread_id.strip(), now=self._format(self._now()),
+        )
+        if not intent:
+            raise ExecutionTransitionError(
+                "Only an outcome_unknown execution with a matching thread may be reconciled"
+            )
+        logger.info("event=gmail_draft_reconciliation_confirmed execution_id=%s review_item_id=%s provider=gmail provider_state=created draft_id=%s",
+                    execution_id, intent.source_review_item_id, draft_id)
+        return intent
+
     def mark_failed(self, execution_id: str, claim_token: str, *, retryable: bool,
-                    error_code: str, metadata: Mapping[str, object] | None = None) -> ExecutionIntent:
+                    error_code: str, metadata: Mapping[str, object] | None = None,
+                    count_attempt: bool = True) -> ExecutionIntent:
         execution_id, claim_token = self._claim_arguments(execution_id, claim_token)
         if not isinstance(error_code, str) or not _ERROR_CODE.fullmatch(error_code):
             raise ValueError("error_code must be a safe lowercase identifier")
@@ -123,7 +199,7 @@ class ExecutionQueueService:
         current = self.get(execution_id)
         if current.status != "processing" or current.claim_token != claim_token:
             raise ExecutionClaimConflictError("Execution claim is missing, stale, or no longer processing")
-        attempt_count = current.attempt_count + 1
+        attempt_count = current.attempt_count + int(bool(count_attempt))
         can_retry = bool(retryable) and attempt_count < self.max_attempts
         now = self._now()
         next_attempt = self._format(now + timedelta(seconds=self._retry_delay(attempt_count))) if can_retry else None

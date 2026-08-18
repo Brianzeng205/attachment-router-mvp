@@ -104,6 +104,9 @@ class GmailClient:
             attachments=attachments,
             thread_id=raw.get("threadId") if isinstance(raw.get("threadId"), str) else None,
             recipients=_recipients(headers),
+            message_id_header=headers.get("message-id"),
+            reply_to=headers.get("reply-to"),
+            references=_message_id_tokens(headers.get("references", "")),
         )
 
     def _attachments(self, message_id: str, part: dict[str, Any], part_path: str) -> Iterable[Attachment]:
@@ -195,6 +198,13 @@ def _recipients(headers: dict[str, str]) -> tuple[str, ...]:
     """Keep parsed delivery facts without changing Gmail MIME processing."""
     values = (headers.get("to", ""), headers.get("cc", ""))
     return tuple(address.strip() for _, address in getaddresses(values) if address.strip())
+
+
+def _message_id_tokens(value: str) -> tuple[str, ...]:
+    """Persist only RFC-looking message-id tokens, preserving their order."""
+    import re
+
+    return tuple(re.findall(r"<[^<>\r\n\s]+@[^<>\r\n\s]+>", value))
 
 
 def _body_text(part: dict[str, Any]) -> str:

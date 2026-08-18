@@ -17,7 +17,7 @@ from .reply_draft_models import PersistedReplyDraft, ReplyDraft, ReplyDraftRun
 from .policy_models import PolicyDecision
 from .review_models import HumanReviewEvent, HumanReviewItem, PersistedPolicyDecision
 from .runtime_models import PollCycleReport, RuntimeRun
-from .execution_models import ExecutionIntent
+from .execution_models import ExecutionIntent, GmailDraftResult
 from .migrations import initialize_schema
 from .database import DEFAULT_SQLITE_BUSY_TIMEOUT_MS, connect_sqlite
 
@@ -553,7 +553,8 @@ class SqliteInboxRepository:
             return _execution_intent_from_row(existing), False
         source = self.connection.execute(
             """SELECT item.id, item.status, item.conversation_id, item.approved_draft_body,
-                      message.provider_thread_id, message.provider_message_id
+                      message.provider_thread_id, message.provider_message_id, message.sender,
+                      message.reply_to, message.subject, message.message_id_header, message.references_json
                FROM human_review_items item
                LEFT JOIN reply_drafts draft ON draft.id=item.reply_draft_id
                LEFT JOIN messages message ON message.id=draft.latest_message_id
@@ -575,12 +576,14 @@ class SqliteInboxRepository:
             cursor = self.connection.execute(
                 """INSERT INTO execution_intents (
                     execution_id, source_review_item_id, conversation_id, provider_thread_id,
-                    in_reply_to_provider_message_id, action_type, approved_body, idempotency_key,
+                    in_reply_to_provider_message_id, action_type, approved_body, recipient, subject,
+                    in_reply_to_header, references_json, idempotency_key,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'send_approved_reply', ?, ?, 'pending',
+                ) VALUES (?, ?, ?, ?, ?, 'create_gmail_draft', ?, ?, ?, ?, ?, ?, 'pending',
                           STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'), STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))""",
                 (execution_id, review_item_id, source["conversation_id"], source["provider_thread_id"],
-                 source["provider_message_id"], body, idempotency_key),
+                 source["provider_message_id"], body, source["reply_to"] or source["sender"],
+                 source["subject"], source["message_id_header"], source["references_json"], idempotency_key),
             )
             created = cursor.rowcount == 1
         except sqlite3.IntegrityError:
@@ -594,7 +597,7 @@ class SqliteInboxRepository:
             self._record_audit_event(AuditEvent(
                 "execution_intent_created", "execution_intent", review_item_id,
                 metadata={"execution_id": execution_id, "review_item_id": review_item_id,
-                          "action_type": "send_approved_reply", "status": "pending"},
+                          "action_type": "create_gmail_draft", "status": "pending"},
             ))
         row = self.connection.execute(
             "SELECT * FROM execution_intents WHERE source_review_item_id=?", (review_item_id,),
@@ -625,7 +628,8 @@ class SqliteInboxRepository:
         return [_execution_intent_from_row(row) for row in rows]
 
     def execution_status_counts(self) -> dict[str, int]:
-        result = {status: 0 for status in ("pending", "processing", "retry_wait", "completed", "failed")}
+        result = {status: 0 for status in
+                  ("pending", "processing", "retry_wait", "completed", "failed", "outcome_unknown")}
         for row in self.connection.execute(
             "SELECT status, COUNT(*) AS count FROM execution_intents GROUP BY status"
         ).fetchall():
@@ -693,6 +697,117 @@ class SqliteInboxRepository:
                 (now, execution_id),
             )
             return self.get_execution_intent(execution_id)
+
+    def complete_gmail_draft_execution(self, execution_id: str, claim_token: str, *, draft_id: str,
+                                       message_id: str | None, thread_id: str, now: str,
+                                       reconciliation_method: str | None = None) -> ExecutionIntent | None:
+        """Persist the provider identity and completion in one claim-protected transaction."""
+        with self.connection:
+            current = self.connection.execute(
+                "SELECT status, claim_token FROM execution_intents WHERE execution_id=?", (execution_id,),
+            ).fetchone()
+            if not current or current["status"] != "processing" or current["claim_token"] != claim_token:
+                return None
+            self.connection.execute(
+                """INSERT INTO gmail_draft_results
+                   (execution_id, provider, provider_draft_id, provider_message_id,
+                    provider_thread_id, reconciliation_method, created_at)
+                   VALUES (?, 'gmail', ?, ?, ?, ?, ?)""",
+                (execution_id, draft_id, message_id, thread_id, reconciliation_method, now),
+            )
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status='completed', completed_at=?, updated_at=?,
+                   attempt_count=attempt_count+1, claim_token=NULL, claimed_by=NULL, claimed_at=NULL,
+                   lease_expires_at=NULL, failure_code=NULL, failure_metadata_json=NULL
+                   WHERE execution_id=? AND status='processing' AND claim_token=?""",
+                (now, now, execution_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Claim changed while recording Gmail draft result")
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   SELECT execution_id, 'gmail_draft_created', attempt_count, ?
+                   FROM execution_intents WHERE execution_id=?""", (now, execution_id),
+            )
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   SELECT execution_id, 'completed', attempt_count, ?
+                   FROM execution_intents WHERE execution_id=?""", (now, execution_id),
+            )
+            return self.get_execution_intent(execution_id)
+
+    def get_gmail_draft_result(self, execution_id: str) -> GmailDraftResult | None:
+        row = self.connection.execute(
+            "SELECT * FROM gmail_draft_results WHERE execution_id=?", (execution_id,),
+        ).fetchone()
+        return _gmail_draft_result_from_row(row) if row else None
+
+    def mark_gmail_outcome_unknown(self, execution_id: str, claim_token: str, *, failure_code: str,
+                                   now: str) -> ExecutionIntent | None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status='outcome_unknown', attempt_count=attempt_count+1,
+                   failure_code=?, failure_metadata_json='{"provider_state":"outcome_unknown"}', updated_at=?,
+                   claim_token=NULL, claimed_by=NULL, claimed_at=NULL, lease_expires_at=NULL
+                   WHERE execution_id=? AND status='processing' AND claim_token=?""",
+                (failure_code, now, execution_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, failure_code, created_at)
+                   SELECT execution_id, 'gmail_draft_outcome_unknown', attempt_count, ?, ?
+                   FROM execution_intents WHERE execution_id=?""", (failure_code, now, execution_id),
+            )
+            return self.get_execution_intent(execution_id)
+
+    def reconcile_gmail_draft_result(self, execution_id: str, *, draft_id: str,
+                                     message_id: str | None, thread_id: str, now: str) -> ExecutionIntent | None:
+        with self.connection:
+            current = self.connection.execute(
+                "SELECT status, provider_thread_id FROM execution_intents WHERE execution_id=?", (execution_id,),
+            ).fetchone()
+            if not current or current["status"] != "outcome_unknown" or current["provider_thread_id"] != thread_id:
+                return None
+            self.connection.execute(
+                """INSERT INTO gmail_draft_results
+                   (execution_id, provider, provider_draft_id, provider_message_id,
+                    provider_thread_id, reconciliation_method, created_at)
+                   VALUES (?, 'gmail', ?, ?, ?, 'operator_confirmed', ?)""",
+                (execution_id, draft_id, message_id, thread_id, now),
+            )
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status='completed', completed_at=?, updated_at=?,
+                   failure_code=NULL, failure_metadata_json=NULL WHERE execution_id=? AND status='outcome_unknown'""",
+                (now, now, execution_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Unknown outcome changed while reconciling")
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   SELECT execution_id, 'gmail_draft_reconciliation_confirmed', attempt_count, ?
+                   FROM execution_intents WHERE execution_id=?""", (now, execution_id),
+            )
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   SELECT execution_id, 'completed', attempt_count, ?
+                   FROM execution_intents WHERE execution_id=?""", (now, execution_id),
+            )
+            return self.get_execution_intent(execution_id)
+
+    def record_execution_event(self, execution_id: str, event_type: str, attempt_count: int,
+                               now: str, failure_code: str | None = None) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, failure_code, created_at)
+                   VALUES (?, ?, ?, ?, ?)""", (execution_id, event_type, attempt_count, failure_code, now),
+            )
 
     def fail_execution(self, execution_id: str, claim_token: str, *, status: str, attempt_count: int,
                        next_attempt_at: str | None, failure_code: str, failure_metadata_json: str | None,
@@ -843,23 +958,28 @@ class SqliteInboxRepository:
     def _upsert_message(self, message: InboxMessage, conversation_id: int) -> tuple[InboxMessage, bool]:
         existing = self.get_message_by_provider_id(message.provider, message.provider_message_id)
         recipients_json = json.dumps(list(message.recipients), ensure_ascii=False, separators=(",", ":"))
+        references_json = json.dumps(list(message.references), ensure_ascii=False, separators=(",", ":"))
         if existing:
             self.connection.execute(
                 """UPDATE messages SET conversation_id = ?, provider_thread_id = ?, sender = ?, recipients_json = ?,
                    subject = ?, body_text = ?, received_at = ?, ingestion_state = ?, content_hash = ?,
+                   message_id_header = ?, reply_to = ?, references_json = ?,
                    updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 (conversation_id, message.provider_thread_id, message.sender, recipients_json, message.subject,
-                 message.body_text, message.received_at, message.ingestion_state, message.content_hash, existing.id),
+                 message.body_text, message.received_at, message.ingestion_state, message.content_hash,
+                 message.message_id_header, message.reply_to, references_json, existing.id),
             )
             return InboxMessage(**{**message.__dict__, "id": existing.id, "conversation_id": conversation_id}), False
         cursor = self.connection.execute(
             """INSERT INTO messages (
                 conversation_id, provider, provider_message_id, provider_thread_id, sender, recipients_json,
-                subject, body_text, received_at, ingestion_state, content_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                subject, body_text, received_at, ingestion_state, content_hash,
+                message_id_header, reply_to, references_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (conversation_id, message.provider, message.provider_message_id, message.provider_thread_id,
              message.sender, recipients_json, message.subject, message.body_text, message.received_at,
-             message.ingestion_state, message.content_hash),
+             message.ingestion_state, message.content_hash, message.message_id_header,
+             message.reply_to, references_json),
         )
         return InboxMessage(**{**message.__dict__, "id": cursor.lastrowid, "conversation_id": conversation_id}), True
 
@@ -879,7 +999,8 @@ def _message_from_row(row: sqlite3.Row) -> InboxMessage:
         provider_message_id=row["provider_message_id"], provider_thread_id=row["provider_thread_id"],
         sender=row["sender"], recipients=tuple(json.loads(row["recipients_json"])), subject=row["subject"],
         body_text=row["body_text"], received_at=row["received_at"], ingestion_state=row["ingestion_state"],
-        content_hash=row["content_hash"],
+        content_hash=row["content_hash"], message_id_header=row["message_id_header"],
+        reply_to=row["reply_to"], references=tuple(json.loads(row["references_json"] or "[]")),
     )
 
 
@@ -966,7 +1087,19 @@ def _execution_intent_from_row(row: sqlite3.Row) -> ExecutionIntent:
         next_attempt_at=row["next_attempt_at"], claim_token=row["claim_token"], claimed_by=row["claimed_by"],
         claimed_at=row["claimed_at"], lease_expires_at=row["lease_expires_at"],
         completed_at=row["completed_at"], failure_code=row["failure_code"], failure_metadata=metadata,
+        recipient=row["recipient"], subject=row["subject"], in_reply_to_header=row["in_reply_to_header"],
+        references=tuple(json.loads(row["references_json"] or "[]")),
+        legacy_action_type=row["legacy_action_type"],
         schema_version=row["schema_version"],
+    )
+
+
+def _gmail_draft_result_from_row(row: sqlite3.Row) -> GmailDraftResult:
+    return GmailDraftResult(
+        execution_id=row["execution_id"], provider=row["provider"],
+        provider_draft_id=row["provider_draft_id"], provider_message_id=row["provider_message_id"],
+        provider_thread_id=row["provider_thread_id"], created_at=row["created_at"],
+        reconciliation_method=row["reconciliation_method"],
     )
 
 

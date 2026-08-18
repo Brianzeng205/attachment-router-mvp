@@ -23,6 +23,9 @@ class EmailMessage:
     attachments: tuple[Attachment, ...]
     thread_id: str | None = None
     recipients: tuple[str, ...] = ()
+    message_id_header: str | None = None
+    reply_to: str | None = None
+    references: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

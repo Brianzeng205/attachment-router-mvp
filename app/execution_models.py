@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 
-ACTION_SEND_APPROVED_REPLY = "send_approved_reply"
-EXECUTION_ACTION_TYPES = frozenset({ACTION_SEND_APPROVED_REPLY})
-EXECUTION_STATUSES = frozenset({"pending", "processing", "retry_wait", "completed", "failed"})
-EXECUTION_SCHEMA_VERSION = 1
+ACTION_CREATE_GMAIL_DRAFT = "create_gmail_draft"
+LEGACY_ACTION_SEND_APPROVED_REPLY = "send_approved_reply"
+EXECUTION_ACTION_TYPES = frozenset({ACTION_CREATE_GMAIL_DRAFT})
+EXECUTION_STATUSES = frozenset({"pending", "processing", "retry_wait", "completed", "failed", "outcome_unknown"})
+EXECUTION_SCHEMA_VERSION = 2
 MAX_EXECUTION_PAYLOAD_CHARS = 50_000
 
 
@@ -35,7 +36,23 @@ class ExecutionIntent:
     completed_at: str | None = None
     failure_code: str | None = None
     failure_metadata: Mapping[str, object] | None = None
+    recipient: str | None = None
+    subject: str | None = None
+    in_reply_to_header: str | None = None
+    references: tuple[str, ...] = ()
+    legacy_action_type: str | None = None
     schema_version: int = EXECUTION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class GmailDraftResult:
+    execution_id: str
+    provider: str
+    provider_draft_id: str
+    provider_message_id: str | None
+    provider_thread_id: str
+    created_at: str
+    reconciliation_method: str | None = None
 
 
 @dataclass(frozen=True)

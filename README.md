@@ -62,7 +62,7 @@ This console has no authentication and is intended only for a trusted local/priv
 
 ## Approved action execution queue (Phase 8B)
 
-Phase 8B adds a durable orchestration boundary after human approval and before any future Gmail adapter. In the same SQLite transaction that changes a review from `pending` to `approved`, the repository creates one `send_approved_reply` execution intent. The intent stores the exact approved body, stable provider thread/message identifiers, a deterministic execution ID and idempotency key, and no credentials or unrelated message content. A database uniqueness constraint on the source review ID makes enqueue idempotent even across concurrent callers. The original AI draft, the review's approved snapshot, and the execution snapshot remain separate records; queue processing never regenerates or edits them.
+Phase 8B adds a durable orchestration boundary after human approval. In the same SQLite transaction that changes a review from `pending` to `approved`, the repository creates one execution intent. Phase 8C1 evolves its action to the truthful `create_gmail_draft`; migrated `send_approved_reply` rows retain that old value in `legacy_action_type` for provenance and are never silently treated as completed sends. The intent stores the exact approved body, stable provider thread/message identifiers, a deterministic execution ID and idempotency key, and no credentials or unrelated message content. A database uniqueness constraint on the source review ID makes enqueue idempotent even across concurrent callers. The original AI draft, the review's approved snapshot, and the execution snapshot remain separate records; queue processing never regenerates or edits them.
 
 The state machine is:
 
@@ -88,7 +88,43 @@ python -m app.execution_status --reconcile
 
 Reconciliation considers only completed `approved` reviews with a valid persisted approved body and provider identity. It skips malformed, pending, and rejected records, and repeated runs do not duplicate intents. Neither inspection nor reconciliation needs Gmail, Drive, Claude, internet connectivity, or OAuth credentials, and neither processes an action.
 
-Phase 8B intentionally registers no production action executor and does **not** send email, create Gmail drafts, modify Gmail, add Gmail write scopes, or invoke Claude. `ActionExecutor` is only a typed boundary for a future Phase 8C adapter, which must consume the stable execution identity/idempotency key. The guarantee here is exactly one durable execution intent per eligible approved review, idempotent enqueue, atomic claim, durable transitions, and stale-claim protection—not mathematically strict exactly-once external execution.
+Approval and queue inspection still perform no provider operation. The guarantee at this boundary is exactly one durable execution intent per eligible approved review, idempotent enqueue, atomic claim, durable transitions, and stale-claim protection—not mathematically strict exactly-once external execution.
+
+## Phase 8C1 Gmail Draft Executor
+
+**Phase 8C1 never sends email.** Its sole Gmail mutation is creating a draft for another human inspection inside Gmail. Although the required `https://www.googleapis.com/auth/gmail.compose` OAuth scope technically also authorizes sending, the production adapter exposes only `users.drafts.create`; it exposes no draft send, message send, modify, label, archive, trash, or delete operation.
+
+Approval creates the immutable `create_gmail_draft` intent but does not call Gmail. Review Console startup, page loads, polling, and status inspection also do not execute it. An operator must deliberately run one item:
+
+```bash
+python -m app.gmail_draft_worker --once
+```
+
+A credential-free, non-mutating validation preview is available with `python -m app.gmail_draft_worker --dry-run`. It claims nothing, calls no provider, and prints only the execution ID and MIME byte size—not recipient, subject, or body. `python -m app.execution_status` shows safe execution/provider state and the Gmail draft ID after confirmed creation.
+
+The executor atomically claims one item using the Phase 8B lease token, builds a plain-text MIME reply only from the intent's immutable approved body, records an external-attempt event immediately before dispatch, calls `drafts.create` once, then persists the returned Gmail draft/message/thread identities and marks completion in one SQLite transaction. A confirmed result is unique per execution and terminal, so later worker invocations cannot create it again. The worker never invokes Claude or regenerates text.
+
+Threading is fail-closed. Ingestion persists normalized Gmail `Message-ID`, `References`, `Reply-To`, sender, subject, and thread ID. Execution requires a valid thread ID and RFC Message-ID, chooses one recipient from persisted `Reply-To` (otherwise sender), rejects header injection, malformed/multiple/self recipients, adds no CC/BCC, normalizes a single `Re:` subject, and supplies Gmail `threadId`, `In-Reply-To`, and `References`. Unicode is serialized with Python's standard email library and base64URL encoded into `message.raw`. Missing legacy metadata fails before any Gmail call rather than creating an unrelated draft.
+
+### Compose authorization
+
+Readonly ingestion remains on `GMAIL_OAUTH_TOKEN_FILE` with only `gmail.readonly`. Draft execution uses a distinct `GMAIL_COMPOSE_OAUTH_TOKEN_FILE` and requests exactly `gmail.compose`; the desktop client JSON may be shared. Set `GMAIL_COMPOSE_ACCOUNT_EMAIL` to the mailbox address so the executor can reject accidental self-replies. Only `--once` loads compose credentials; Review Console, status, polling, and dry-run do not.
+
+Existing readonly tokens do not gain compose permission. Do not reuse the readonly token path. To authorize compose, choose a new private token path, run `python -m app.gmail_draft_worker --once`, and complete Google's browser consent. If an existing configured compose token lacks the scope, the worker stops with a compose-authorization error and does not delete or overwrite it. Move that file aside manually or choose another path only after verifying it is the token you intend to replace. To return to readonly-only operation, stop invoking the draft worker and remove the compose settings/token from the runtime environment; polling continues with its separate readonly token.
+
+### Ambiguous outcomes and reconciliation
+
+Gmail's create POST has no local SQLite idempotency key. If a timeout, disconnect, malformed success response, or other transport failure occurs after dispatch, Gmail may have created the draft even though its ID was not received. The executor persists `outcome_unknown`, clears the lease, and blocks normal claiming and all automatic retries. This state survives restart.
+
+Phase 8C1 deliberately performs no speculative Gmail search and makes no guarantee that Gmail preserves or indexes the deterministic MIME `Message-ID`. An operator must inspect Gmail manually. If the draft is found, confirm its IDs without another create call:
+
+```bash
+python -m app.gmail_draft_worker --reconcile exec_... --draft-id gmail-draft-id --thread-id gmail-thread-id
+```
+
+The thread ID must match the intent. If no draft can be established, Phase 8C1 leaves the item unresolved; it does not offer a blind retry switch. The actual guarantee is one durable local intent, one active claim, no re-execution after a confirmed result, and at most one automatic create attempt per unresolved external outcome—not strict exactly-once draft creation.
+
+Current limitations are plain-text single-recipient replies, manual reconciliation of unknown outcomes, no reply-all, no attachments, and no Gmail-side E2E test in the automated suite. A future Phase 8C2 may add a separately reviewed and separately implemented send boundary; no such boundary exists here.
 
 ## Google Drive setup
 
