@@ -44,6 +44,22 @@ Logging is configured with these environment variables:
 
 The application creates the log directory when file logging is enabled. Local logs and runtime SQLite artifacts under `data/` are ignored by Git; other project files placed in `data/` are not ignored wholesale.
 
+## Human Review Console
+
+Phase 8A provides a local, server-rendered operator console over review items already persisted in SQLite. Start it from the repository root with:
+
+```bash
+python -m app.review_console
+```
+
+Open `http://localhost:8000`. In GitHub Codespaces, use the forwarded port 8000 URL and keep its visibility private. The console reads `STATE_DB_PATH` (default `data/state.sqlite3`) and creates/additively upgrades the local schema when opened. It does not require Gmail, Google Drive, or Claude credentials and does not start polling, analysis, retrieval, or draft generation.
+
+The queue defaults to pending items and can be filtered to approved or rejected history. A pending item shows persisted message/thread context, readable analyses, supporting retrieval context, the policy decision, and the original generated reply. An operator can edit the reply and approve it, or reject it with an optional note. Approval stores the final human-approved text separately from the immutable AI-generated draft. Completed items are read-only, and stale or repeated submissions cannot replace an existing decision.
+
+**Approval means only “approved for a future downstream action.” It does not send email, create a Gmail draft, or modify Gmail in any way.** Phase 8A includes no send action or Gmail write scope.
+
+This console has no authentication and is intended only for a trusted local/private operator environment. It must not be exposed to the public internet. Other current limitations are a single operator identity entered per decision, plain-text message/draft rendering, no decision reversal, and no downstream Gmail action.
+
 ## Google Drive setup
 
 1. Create or choose a Google Cloud project in the [Google Cloud Console](https://console.cloud.google.com/).

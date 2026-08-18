@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .policy_models import PolicyDecision
 
@@ -32,6 +33,9 @@ class HumanReviewItem:
     status: str
     reviewer_id: str | None = None
     resolved_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    approved_draft_body: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,3 +53,45 @@ class ReviewQueueOutcome:
     policy_decision: PersistedPolicyDecision
     review_item: HumanReviewItem | None
     reused: bool
+
+
+@dataclass(frozen=True)
+class ReviewQueueEntry:
+    id: int
+    status: str
+    review_type: str
+    created_at: str
+    updated_at: str
+    confidence: float | None
+    review_reason: str
+    sender: str | None
+    subject: str | None
+    summary: str | None
+    has_draft: bool
+
+
+@dataclass(frozen=True)
+class ReviewDetail:
+    item: HumanReviewItem
+    messages: tuple[dict[str, Any], ...]
+    message_analysis: dict[str, Any] | None
+    thread_analysis: dict[str, Any] | None
+    retrieval_context: tuple[dict[str, Any], ...]
+    policy: dict[str, Any]
+    original_draft_body: str | None
+    draft_subject: str | None
+    draft_confidence: float | None
+    draft_review_reason: str | None
+    history: tuple[HumanReviewEvent, ...]
+
+
+class ReviewNotFoundError(LookupError):
+    pass
+
+
+class ReviewConflictError(ValueError):
+    pass
+
+
+class ReviewValidationError(ValueError):
+    pass
