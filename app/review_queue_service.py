@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewQueueService:
-    """Persists local review state only; approval carries no external execution authority."""
+    """Persists review state and atomically hands approved snapshots to the local execution queue."""
 
     def __init__(self, repository, *, policy_configuration: Mapping[str, object] | None = None) -> None:
         self._repository = repository
@@ -163,6 +163,12 @@ class ReviewQueueService:
                 raise ReviewNotFoundError("Review item not found") from exc
             raise ReviewConflictError(str(exc)) from exc
         logger.info("event=review_%s review_item_id=%s status=%s", status, review_item_id, status)
+        if status == "approved":
+            intent = self._repository.get_execution_for_review(review_item_id)
+            logger.info(
+                "event=execution_intent_created execution_id=%s review_item_id=%s action_type=%s status=%s",
+                intent.execution_id, review_item_id, intent.action_type, intent.status,
+            )
         return item
 
     @staticmethod

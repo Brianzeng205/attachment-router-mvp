@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ from .reply_draft_models import PersistedReplyDraft, ReplyDraft, ReplyDraftRun
 from .policy_models import PolicyDecision
 from .review_models import HumanReviewEvent, HumanReviewItem, PersistedPolicyDecision
 from .runtime_models import PollCycleReport, RuntimeRun
+from .execution_models import ExecutionIntent
 from .migrations import initialize_schema
 from .database import DEFAULT_SQLITE_BUSY_TIMEOUT_MS, connect_sqlite
 
@@ -534,8 +536,230 @@ class SqliteInboxRepository:
                 metadata={"policy_decision_id": row["policy_decision_id"], "review_type": row["review_type"],
                           "status": status, "reviewer_id": reviewer_id},
             ))
+            if status == "approved":
+                self._enqueue_execution_for_review(review_item_id)
             updated = self.connection.execute("SELECT * FROM human_review_items WHERE id=?", (review_item_id,)).fetchone()
             return _review_item_from_row(updated)
+
+    def enqueue_execution_for_review(self, review_item_id: int) -> tuple[ExecutionIntent, bool]:
+        with self.connection:
+            return self._enqueue_execution_for_review(review_item_id)
+
+    def _enqueue_execution_for_review(self, review_item_id: int) -> tuple[ExecutionIntent, bool]:
+        existing = self.connection.execute(
+            "SELECT * FROM execution_intents WHERE source_review_item_id=?", (review_item_id,),
+        ).fetchone()
+        if existing:
+            return _execution_intent_from_row(existing), False
+        source = self.connection.execute(
+            """SELECT item.id, item.status, item.conversation_id, item.approved_draft_body,
+                      message.provider_thread_id, message.provider_message_id
+               FROM human_review_items item
+               LEFT JOIN reply_drafts draft ON draft.id=item.reply_draft_id
+               LEFT JOIN messages message ON message.id=draft.latest_message_id
+               WHERE item.id=?""", (review_item_id,),
+        ).fetchone()
+        if not source:
+            raise ValueError("Review item does not exist")
+        if source["status"] != "approved":
+            raise ValueError("Only approved review items may be enqueued")
+        body = source["approved_draft_body"]
+        if not isinstance(body, str) or not body.strip() or len(body) > 50_000:
+            raise ValueError("Approved review is missing a valid approved snapshot")
+        if not source["provider_thread_id"] or not source["provider_message_id"]:
+            raise ValueError("Approved review is missing durable provider identity")
+        digest = hashlib.sha256(f"execution-intent:v1:review:{review_item_id}".encode("ascii")).hexdigest()
+        execution_id = f"exec_{digest[:32]}"
+        idempotency_key = f"approved-review:{digest}"
+        try:
+            cursor = self.connection.execute(
+                """INSERT INTO execution_intents (
+                    execution_id, source_review_item_id, conversation_id, provider_thread_id,
+                    in_reply_to_provider_message_id, action_type, approved_body, idempotency_key,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'send_approved_reply', ?, ?, 'pending',
+                          STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'), STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))""",
+                (execution_id, review_item_id, source["conversation_id"], source["provider_thread_id"],
+                 source["provider_message_id"], body, idempotency_key),
+            )
+            created = cursor.rowcount == 1
+        except sqlite3.IntegrityError:
+            created = False
+        if created:
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   VALUES (?, 'created', 0, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))""", (execution_id,),
+            )
+            self._record_audit_event(AuditEvent(
+                "execution_intent_created", "execution_intent", review_item_id,
+                metadata={"execution_id": execution_id, "review_item_id": review_item_id,
+                          "action_type": "send_approved_reply", "status": "pending"},
+            ))
+        row = self.connection.execute(
+            "SELECT * FROM execution_intents WHERE source_review_item_id=?", (review_item_id,),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("Execution intent insert did not produce a durable row")
+        return _execution_intent_from_row(row), created
+
+    def get_execution_intent(self, execution_id: str) -> ExecutionIntent | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_intents WHERE execution_id=?", (execution_id,),
+        ).fetchone()
+        return _execution_intent_from_row(row) if row else None
+
+    def get_execution_for_review(self, review_item_id: int) -> ExecutionIntent | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_intents WHERE source_review_item_id=?", (review_item_id,),
+        ).fetchone()
+        return _execution_intent_from_row(row) if row else None
+
+    def list_execution_intents(self, status: str | None = None) -> list[ExecutionIntent]:
+        if status is None:
+            rows = self.connection.execute("SELECT * FROM execution_intents ORDER BY created_at, execution_id").fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM execution_intents WHERE status=? ORDER BY created_at, execution_id", (status,),
+            ).fetchall()
+        return [_execution_intent_from_row(row) for row in rows]
+
+    def execution_status_counts(self) -> dict[str, int]:
+        result = {status: 0 for status in ("pending", "processing", "retry_wait", "completed", "failed")}
+        for row in self.connection.execute(
+            "SELECT status, COUNT(*) AS count FROM execution_intents GROUP BY status"
+        ).fetchall():
+            result[row["status"]] = row["count"]
+        return result
+
+    def list_approved_reviews_without_execution(self) -> list[int]:
+        rows = self.connection.execute(
+            """SELECT item.id FROM human_review_items item
+               LEFT JOIN execution_intents intent ON intent.source_review_item_id=item.id
+               WHERE item.status='approved' AND intent.execution_id IS NULL ORDER BY item.id"""
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def claim_next_execution(self, *, worker_id: str, claim_token: str, now: str, lease_expires_at: str) -> ExecutionIntent | None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """SELECT execution_id FROM execution_intents
+                   WHERE status='pending' OR (status='retry_wait' AND next_attempt_at<=?)
+                   ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at, execution_id LIMIT 1""", (now,),
+            ).fetchone()
+            if not row:
+                self.connection.commit()
+                return None
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status='processing', claim_token=?, claimed_by=?,
+                   claimed_at=?, lease_expires_at=?, next_attempt_at=NULL, updated_at=?
+                   WHERE execution_id=? AND (status='pending' OR (status='retry_wait' AND next_attempt_at<=?))""",
+                (claim_token, worker_id, now, lease_expires_at, now, row["execution_id"], now),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                return None
+            claimed = self.connection.execute(
+                "SELECT * FROM execution_intents WHERE execution_id=?", (row["execution_id"],),
+            ).fetchone()
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   VALUES (?, 'claimed', ?, ?)""",
+                (row["execution_id"], claimed["attempt_count"] + 1, now),
+            )
+            self.connection.commit()
+            return _execution_intent_from_row(claimed)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def complete_execution(self, execution_id: str, claim_token: str, now: str) -> ExecutionIntent | None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status='completed', completed_at=?, updated_at=?,
+                   claim_token=NULL, claimed_by=NULL, claimed_at=NULL, lease_expires_at=NULL,
+                   failure_code=NULL, failure_metadata_json=NULL
+                   WHERE execution_id=? AND status='processing' AND claim_token=?""",
+                (now, now, execution_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, created_at)
+                   SELECT execution_id, 'completed', attempt_count, ? FROM execution_intents WHERE execution_id=?""",
+                (now, execution_id),
+            )
+            return self.get_execution_intent(execution_id)
+
+    def fail_execution(self, execution_id: str, claim_token: str, *, status: str, attempt_count: int,
+                       next_attempt_at: str | None, failure_code: str, failure_metadata_json: str | None,
+                       now: str) -> ExecutionIntent | None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE execution_intents SET status=?, attempt_count=?, next_attempt_at=?, failure_code=?,
+                   failure_metadata_json=?, updated_at=?, claim_token=NULL, claimed_by=NULL,
+                   claimed_at=NULL, lease_expires_at=NULL
+                   WHERE execution_id=? AND status='processing' AND claim_token=?""",
+                (status, attempt_count, next_attempt_at, failure_code, failure_metadata_json, now,
+                 execution_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self.connection.execute(
+                """INSERT INTO execution_events
+                   (execution_id, event_type, attempt_count, failure_code, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (execution_id, "retry_scheduled" if status == "retry_wait" else "failed",
+                 attempt_count, failure_code, now),
+            )
+            return self.get_execution_intent(execution_id)
+
+    def recover_expired_executions(self, *, now: str, next_attempt_at: str, failure_code: str,
+                                   max_attempts: int) -> list[str]:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                """SELECT execution_id FROM execution_intents
+                   WHERE status='processing' AND lease_expires_at<=? ORDER BY execution_id""", (now,),
+            ).fetchall()
+            recovered = []
+            for row in rows:
+                execution_id = row["execution_id"]
+                cursor = self.connection.execute(
+                    """UPDATE execution_intents
+                        SET status=CASE WHEN attempt_count+1>=? THEN 'failed' ELSE 'retry_wait' END,
+                        attempt_count=attempt_count+1,
+                        next_attempt_at=CASE WHEN attempt_count+1>=? THEN NULL ELSE ? END,
+                        failure_code=?, failure_metadata_json=NULL, updated_at=?,
+                        claim_token=NULL, claimed_by=NULL, claimed_at=NULL, lease_expires_at=NULL
+                        WHERE execution_id=? AND status='processing' AND lease_expires_at<=?""",
+                    (max_attempts, max_attempts, next_attempt_at, failure_code, now, execution_id, now),
+                )
+                if cursor.rowcount == 1:
+                    recovered.append(execution_id)
+                    state = self.connection.execute(
+                        "SELECT status, attempt_count FROM execution_intents WHERE execution_id=?", (execution_id,),
+                    ).fetchone()
+                    self.connection.execute(
+                        """INSERT INTO execution_events
+                           (execution_id, event_type, attempt_count, failure_code, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (execution_id, "failed" if state["status"] == "failed" else "claim_recovered",
+                         state["attempt_count"], failure_code, now),
+                    )
+            self.connection.commit()
+            return recovered
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def list_execution_events(self, execution_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM execution_events WHERE execution_id=? ORDER BY id", (execution_id,),
+        ).fetchall()
 
     def mark_running_runtime_runs_abandoned(self) -> int:
         with self.connection:
@@ -722,6 +946,27 @@ def _runtime_run_from_row(row: sqlite3.Row) -> RuntimeRun:
         row["completed_at"], row["error_class"], row["lock_outcome"],
         row["messages_polled"], row["inbox_errors"], row["attachments_uploaded"],
         row["attachments_skipped"], row["attachment_errors"],
+    )
+
+
+def _execution_intent_from_row(row: sqlite3.Row) -> ExecutionIntent:
+    metadata = None
+    if row["failure_metadata_json"]:
+        try:
+            parsed = json.loads(row["failure_metadata_json"])
+            metadata = parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError):
+            metadata = None
+    return ExecutionIntent(
+        execution_id=row["execution_id"], source_review_item_id=row["source_review_item_id"],
+        conversation_id=row["conversation_id"], provider_thread_id=row["provider_thread_id"],
+        in_reply_to_provider_message_id=row["in_reply_to_provider_message_id"], action_type=row["action_type"],
+        approved_body=row["approved_body"], idempotency_key=row["idempotency_key"], status=row["status"],
+        attempt_count=row["attempt_count"], created_at=row["created_at"], updated_at=row["updated_at"],
+        next_attempt_at=row["next_attempt_at"], claim_token=row["claim_token"], claimed_by=row["claimed_by"],
+        claimed_at=row["claimed_at"], lease_expires_at=row["lease_expires_at"],
+        completed_at=row["completed_at"], failure_code=row["failure_code"], failure_metadata=metadata,
+        schema_version=row["schema_version"],
     )
 
 
