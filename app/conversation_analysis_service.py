@@ -38,8 +38,11 @@ class ConversationAnalysisService:
                 outcome = self.analyze_conversation(conversation)
                 summary = ConversationAnalysisSummary(summary.analyzed + int(outcome == "analyzed"),
                     summary.skipped + int(outcome == "skipped"), summary.errors)
-            except Exception:
-                logger.exception("Conversation analysis failed conversation_id=%s", conversation.id)
+            except Exception as exc:
+                logger.error(
+                    "event=conversation_analysis_failed conversation_id=%s error_class=%s",
+                    conversation.id, type(exc).__name__,
+                )
                 summary = ConversationAnalysisSummary(summary.analyzed, summary.skipped, summary.errors + 1)
         return summary
 

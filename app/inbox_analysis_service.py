@@ -39,8 +39,11 @@ class InboxAnalysisService:
                 outcome = self.analyze_email(email, provider)
                 summary = AnalysisSummary(summary.analyzed + int(outcome == "analyzed"),
                                           summary.skipped + int(outcome == "skipped"), summary.errors)
-            except Exception:
-                logger.exception("Inbox analysis failed message_id=%s", email.id)
+            except Exception as exc:
+                logger.error(
+                    "event=inbox_analysis_failed message_id=%s error_class=%s",
+                    email.id, type(exc).__name__,
+                )
                 summary = AnalysisSummary(summary.analyzed, summary.skipped, summary.errors + 1)
         return summary
 

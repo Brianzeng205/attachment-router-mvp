@@ -58,12 +58,18 @@ class RetryPolicy:
                 return operation()
             except Exception as exc:
                 if attempt >= self.max_attempts or not retry_if(exc):
+                    if attempt >= self.max_attempts:
+                        logger.error(
+                            "event=provider_retry_exhausted provider=%s operation=%s max_attempts=%d "
+                            "final_error_class=%s",
+                            provider, operation_name, self.max_attempts, type(exc).__name__,
+                        )
                     raise
                 delay = self._delay_after_failure(attempt)
                 logger.warning(
-                    "Transient provider failure provider=%s operation=%s attempt=%d max_attempts=%d "
-                    "error_class=%s",
-                    provider, operation_name, attempt, self.max_attempts, type(exc).__name__,
+                    "event=provider_retry provider=%s operation=%s attempt=%d max_attempts=%d "
+                    "error_class=%s retry_delay_seconds=%.2f",
+                    provider, operation_name, attempt, self.max_attempts, type(exc).__name__, delay,
                 )
                 self.sleeper(delay)
         raise AssertionError("retry loop exhausted without returning or raising")

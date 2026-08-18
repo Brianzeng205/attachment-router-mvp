@@ -7,3 +7,7 @@ secrets/
 __pycache__/
 .pytest_cache/
 *.pyc
+logs/
+/data/*.sqlite3
+/data/*.sqlite3-*
+/data/*.sqlite3.poll.lock

@@ -36,8 +36,11 @@ class AttachmentProcessor:
                     self.state.mark_processed(message.id, attachment.id)
                     logger.info("Processed attachment email_id=%s attachment_id=%s", message.id, attachment.id)
                     summary = ProcessingSummary(summary.uploaded + 1, summary.skipped, summary.errors)
-                except Exception:
-                    logger.exception("Failed attachment email_id=%s attachment_id=%s", message.id, attachment.id)
+                except Exception as exc:
+                    logger.error(
+                        "event=attachment_failed email_id=%s attachment_id=%s error_class=%s",
+                        message.id, attachment.id, type(exc).__name__,
+                    )
                     summary = ProcessingSummary(summary.uploaded, summary.skipped, summary.errors + 1)
         return summary
 
@@ -51,8 +54,8 @@ class AttachmentProcessor:
             folder_id = self.settings.needs_review_folder_id
             filename = self._safe_filename(attachment.filename, attachment.filename)
         logger.info(
-            "Routing attachment email_id=%s attachment_id=%s filename=%s folder_id=%s",
-            message.id, attachment.id, attachment.filename, folder_id,
+            "Routing attachment email_id=%s attachment_id=%s folder_id=%s",
+            message.id, attachment.id, folder_id,
         )
         drive_file_id = self.drive.upload(
             folder_id=folder_id,

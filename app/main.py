@@ -75,11 +75,13 @@ def run_once(settings: Settings | None = None) -> PollCycleReport:
             return process_poll_cycle(messages=messages, repository=repository, message_ingestion_service=ingestion, inbox_analysis_service=inbox, conversation_analysis_service=conversation, knowledge_retrieval_service=retrieval, reply_draft_service=drafting, thread_context_builder=context_builder, decision_policy=decision_policy, review_queue_service=review_queue, attachment_processor=processor)
         finally:
             repository.close()
-    except Exception:
+    except Exception as exc:
         if cycle_started:
             raise
         # The existing attachment router remains independently operable.
-        logging.getLogger(__name__).exception("Inbox persistence path could not be initialised")
+        logging.getLogger(__name__).error(
+            "event=inbox_initialization_failed error_class=%s", type(exc).__name__,
+        )
     attachment_summary = AttachmentProcessor(
         _StaticEmailClient(messages), build_classifier(settings), build_drive(settings),
         SqliteStateManager(settings.state_db_path, settings.sqlite_busy_timeout_ms), settings,
@@ -135,12 +137,17 @@ def process_poll_cycle(*, messages, repository, message_ingestion_service, inbox
                                 reply_draft_id=persisted_draft.id, reply_draft_fingerprint=draft_fingerprint,
                                 decision=policy_decision,
                             )
-                    except Exception:
+                    except Exception as exc:
                         inbox_errors += 1
-                        logging.getLogger(__name__).exception("Local drafting/policy/review failed conversation_id=%s", conversation.id)
-    except Exception:
+                        logging.getLogger(__name__).error(
+                            "event=local_workflow_failed conversation_id=%s error_class=%s",
+                            conversation.id, type(exc).__name__,
+                        )
+    except Exception as exc:
         inbox_errors += 1
-        logging.getLogger(__name__).exception("Inbox agent branch failed")
+        logging.getLogger(__name__).error(
+            "event=inbox_branch_failed error_class=%s", type(exc).__name__,
+        )
     attachment_summary = attachment_processor.process_all()
     return _poll_cycle_report(len(messages), inbox_errors, attachment_summary)
 
@@ -174,22 +181,30 @@ class _StaticEmailClient:
 
 def main() -> int:
     """Stable one-shot CLI entrypoint; recurring scheduling remains external."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         settings = Settings.from_env()
+        from .logging_config import configure_logging
+        configure_logging(
+            log_level=settings.log_level,
+            log_file=settings.log_file,
+            log_max_bytes=settings.log_max_bytes,
+            log_backup_count=settings.log_backup_count,
+        )
+        logger = logging.getLogger(__name__)
+        logger.info("event=runtime_started")
         coordinator = RuntimeCoordinator(
             settings.state_db_path, lambda: run_once(settings), trigger_type="cli",
             sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
         )
-        result = coordinator.execute_once()
-        if result.status == "skipped_locked":
-            logging.getLogger(__name__).info("Polling cycle skipped because another worker owns the lock")
+        coordinator.execute_once()
         return 0
     except KeyboardInterrupt:
-        logging.getLogger(__name__).warning("Polling cycle interrupted")
+        logging.getLogger(__name__).warning("event=runtime_interrupted status=interrupted")
         return 130
-    except Exception:
-        logging.getLogger(__name__).exception("Polling cycle failed")
+    except Exception as exc:
+        logging.getLogger(__name__).error(
+            "event=runtime_failed status=failed error_class=%s", type(exc).__name__,
+        )
         return 1
 
 

@@ -50,6 +50,10 @@ class Settings:
     provider_retry_jitter_ratio: float = 0.1
     provider_request_timeout_seconds: float = 30.0
     sqlite_busy_timeout_ms: int = 5_000
+    log_level: str = "INFO"
+    log_file: Path | None = None
+    log_max_bytes: int = 5 * 1024 * 1024
+    log_backup_count: int = 3
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -122,6 +126,20 @@ class Settings:
             raise ValueError("PROVIDER_REQUEST_TIMEOUT_SECONDS must be between 0 and 300")
         if sqlite_busy_timeout_ms < 0 or sqlite_busy_timeout_ms > 60_000:
             raise ValueError("SQLITE_BUSY_TIMEOUT_MS must be between 0 and 60000")
+        log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        log_file_str = os.environ.get("LOG_FILE", "").strip()
+        log_file = Path(log_file_str) if log_file_str else None
+        try:
+            log_max_bytes = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+            log_backup_count = int(os.environ.get("LOG_BACKUP_COUNT", "3"))
+        except ValueError as exc:
+            raise ValueError("LOG_MAX_BYTES and LOG_BACKUP_COUNT must be integers") from exc
+        if log_max_bytes < 1024 or log_max_bytes > 1024 * 1024 * 1024:
+            raise ValueError("LOG_MAX_BYTES must be between 1024 and 1073741824")
+        if log_backup_count < 0 or log_backup_count > 100:
+            raise ValueError("LOG_BACKUP_COUNT must be between 0 and 100")
         return cls(
             threshold,
             review_folder,
@@ -153,6 +171,7 @@ class Settings:
             os.environ.get("REPLY_DRAFT_GENERATOR_VERSION", "v1"), os.environ.get("REPLY_DRAFT_PROMPT_VERSION", "v1"),
             retry_max_attempts, retry_initial_delay, retry_max_delay, retry_multiplier, retry_jitter_ratio,
             request_timeout, sqlite_busy_timeout_ms,
+            log_level, log_file, log_max_bytes, log_backup_count,
         )
 
     @property

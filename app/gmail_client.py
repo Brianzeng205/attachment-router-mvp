@@ -62,7 +62,10 @@ class GmailClient:
                     error = self._map_error(exc, f"Could not retrieve Gmail message {message_id}", GmailMessageError)
                     if isinstance(error, (GmailAuthenticationError, GmailRateLimitError)):
                         raise error
-                    logger.error("%s", error)
+                    logger.error(
+                        "event=gmail_message_failed message_id=%s error_class=%s",
+                        message_id, type(error).__name__,
+                    )
         except (GmailAuthenticationError, GmailRateLimitError, GmailAPIError):
             raise
 
@@ -120,7 +123,10 @@ class GmailClient:
                 if content is not None:
                     yield Attachment(stable_id, filename.strip(), content, mime_type)
             except GmailAttachmentError as exc:
-                logger.error("%s message_id=%s attachment_id=%s filename=%s", exc, message_id, stable_id, filename)
+                logger.error(
+                    "event=gmail_attachment_failed message_id=%s attachment_id=%s error_class=%s",
+                    message_id, stable_id, type(exc).__name__,
+                )
         parts = part.get("parts", [])
         if isinstance(parts, list):
             for index, child in enumerate(parts):

@@ -35,8 +35,11 @@ class MessageIngestionService:
                 summary = IngestionSummary(
                     summary.ingested + int(created), summary.duplicates + int(not created), summary.errors,
                 )
-            except Exception:
-                logger.exception("Inbox message persistence failed message_id=%s", message.id)
+            except Exception as exc:
+                logger.error(
+                    "event=message_persistence_failed message_id=%s error_class=%s",
+                    message.id, type(exc).__name__,
+                )
                 summary = IngestionSummary(summary.ingested, summary.duplicates, summary.errors + 1)
         return summary
 
