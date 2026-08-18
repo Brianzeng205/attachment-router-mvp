@@ -209,6 +209,9 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_policy_decisions_draft ON policy_decisions(reply_draft_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_pending ON human_review_items(status, created_at, id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_item ON human_review_events(review_item_id, id)")
+    review_columns = {row[1] for row in connection.execute("PRAGMA table_info(human_review_items)").fetchall()}
+    if "approved_draft_body" not in review_columns:
+        connection.execute("ALTER TABLE human_review_items ADD COLUMN approved_draft_body TEXT")
     connection.execute("""CREATE TABLE IF NOT EXISTS runtime_runs (
         id INTEGER PRIMARY KEY,
         trigger_type TEXT NOT NULL,

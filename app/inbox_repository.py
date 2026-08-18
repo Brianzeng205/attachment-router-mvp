@@ -434,6 +434,65 @@ class SqliteInboxRepository:
         ).fetchall()
         return [_review_item_from_row(row) for row in rows]
 
+    def list_review_queue_rows(self, status: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """SELECT item.*, draft.confidence, draft.review_reason AS draft_review_reason,
+                      draft.body IS NOT NULL AS has_draft, message.sender, message.subject,
+                      analysis.conversation_summary, policy.primary_reason
+               FROM human_review_items item
+               LEFT JOIN reply_drafts draft ON draft.id=item.reply_draft_id
+               LEFT JOIN messages message ON message.id=draft.latest_message_id
+               LEFT JOIN policy_decisions policy ON policy.id=item.policy_decision_id
+               LEFT JOIN conversation_analyses analysis ON analysis.id=policy.conversation_analysis_id
+               WHERE item.status=?
+               ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END,
+                        item.updated_at DESC, item.id DESC""", (status,),
+        ).fetchall()
+
+    def get_review_detail_rows(self, review_item_id: int):
+        item = self.connection.execute(
+            """SELECT item.*, draft.body AS original_draft_body, draft.subject AS draft_subject,
+                      draft.confidence AS draft_confidence, draft.review_reason AS draft_review_reason,
+                      policy.decision, policy.policy_version, policy.reason_codes_json, policy.primary_reason,
+                      policy.conversation_analysis_id, draft.latest_message_id, run.knowledge_retrieval_run_id
+               FROM human_review_items item
+               LEFT JOIN policy_decisions policy ON policy.id=item.policy_decision_id
+               LEFT JOIN reply_drafts draft ON draft.id=item.reply_draft_id
+               LEFT JOIN reply_draft_runs run ON run.id=draft.draft_run_id
+               WHERE item.id=?""", (review_item_id,),
+        ).fetchone()
+        if not item:
+            return None
+        messages = self.connection.execute(
+            """SELECT id, sender, subject, body_text, received_at
+               FROM messages WHERE conversation_id=? ORDER BY received_at, id""",
+            (item["conversation_id"],),
+        ).fetchall()
+        message_analysis = None
+        if item["latest_message_id"] is not None:
+            message_analysis = self.connection.execute(
+                """SELECT category, intent, priority, urgency, summary, confidence, needs_human,
+                          human_reason, recommended_action, order_numbers_json, dates_json, requirements_json
+                   FROM message_analyses WHERE message_id=? ORDER BY id DESC LIMIT 1""",
+                (item["latest_message_id"],),
+            ).fetchone()
+        thread_analysis = None
+        if item["conversation_analysis_id"] is not None:
+            thread_analysis = self.connection.execute(
+                "SELECT * FROM conversation_analyses WHERE id=?", (item["conversation_analysis_id"],),
+            ).fetchone()
+        retrieval = []
+        if item["knowledge_retrieval_run_id"] is not None:
+            retrieval = self.connection.execute(
+                """SELECT result.rank, result.score, document.title, document.source_filename, chunk.chunk_text
+                   FROM knowledge_retrieval_results result
+                   JOIN knowledge_chunks chunk ON chunk.id=result.knowledge_chunk_id
+                   JOIN knowledge_documents document ON document.id=chunk.document_id
+                   WHERE result.retrieval_run_id=? ORDER BY result.rank, result.id""",
+                (item["knowledge_retrieval_run_id"],),
+            ).fetchall()
+        return item, messages, message_analysis, thread_analysis, retrieval
+
     def list_review_events(self, review_item_id: int) -> list[HumanReviewEvent]:
         rows = self.connection.execute(
             "SELECT * FROM human_review_events WHERE review_item_id=? ORDER BY id ASC", (review_item_id,),
@@ -441,7 +500,8 @@ class SqliteInboxRepository:
         return [_review_event_from_row(row) for row in rows]
 
     def transition_review_item(self, review_item_id: int, status: str, reviewer_id: str,
-                               note: str | None) -> HumanReviewItem:
+                               note: str | None, *, expected_updated_at: str | None = None,
+                               approved_draft_body: str | None = None) -> HumanReviewItem:
         event_by_status = {
             "approved": "human_review_approved", "rejected": "human_review_rejected",
             "changes_requested": "human_review_changes_requested",
@@ -456,10 +516,15 @@ class SqliteInboxRepository:
                 raise ValueError("Only pending review items may transition")
             if row["review_type"] == "blocked_resolution" and status == "approved":
                 raise ValueError("Blocked review items cannot be approved")
-            self.connection.execute(
+            expected = expected_updated_at if expected_updated_at is not None else row["updated_at"]
+            cursor = self.connection.execute(
                 """UPDATE human_review_items SET status=?, reviewer_id=?, updated_at=CURRENT_TIMESTAMP,
-                   resolved_at=CURRENT_TIMESTAMP WHERE id=?""", (status, reviewer_id, review_item_id),
+                   resolved_at=CURRENT_TIMESTAMP, approved_draft_body=?
+                   WHERE id=? AND status='pending' AND updated_at=?""",
+                (status, reviewer_id, approved_draft_body, review_item_id, expected),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Review item changed after it was opened")
             self.connection.execute(
                 """INSERT INTO human_review_events (review_item_id, event_type, reviewer_id, note)
                    VALUES (?, ?, ?, ?)""", (review_item_id, status, reviewer_id, note),
@@ -641,6 +706,7 @@ def _review_item_from_row(row: sqlite3.Row) -> HumanReviewItem:
     return HumanReviewItem(
         row["id"], row["policy_decision_id"], row["conversation_id"], row["reply_draft_id"],
         row["review_type"], row["status"], row["reviewer_id"], row["resolved_at"],
+        row["created_at"], row["updated_at"], row["approved_draft_body"],
     )
 
 
